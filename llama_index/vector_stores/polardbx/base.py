@@ -410,7 +410,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 return result.fetchone() is not None
         except Exception as e:
             err_msg = str(e).upper()
-            if "NO VECTOR INDEX" in err_msg or "CANNOT DETERMINE" in err_msg:
+            # v3: VEC_DISTANCE without index context reports
+            # ER_VEC_DISTANCE_TYPE, or messages like "NO VECTOR INDEX",
+            # "CANNOT DETERMINE". All indicate the function EXISTS.
+            if (
+                "NO VECTOR INDEX" in err_msg
+                or "CANNOT DETERMINE" in err_msg
+                or "VEC_DISTANCE_TYPE" in err_msg
+                or "ER_VEC_DISTANCE" in err_msg
+            ):
                 _logger.debug(
                     "VEC_DISTANCE exists but needs index context: %s", e
                 )
@@ -679,7 +687,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 if row:
                     create_sql = str(row[1]) if len(row) > 1 else ""
                     m = re.search(
-                        r"VECTOR INDEX `([^`]+)`", create_sql, re.IGNORECASE
+                        r"VECTOR INDEX\s+`?(\w+)`?", create_sql,
+                        re.IGNORECASE
                     )
                     if m:
                         self._vector_index_name = m.group(1)
@@ -1027,6 +1036,70 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         return nodes
 
+    async def aget_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+    ) -> List[BaseNode]:
+        """Async get nodes from the vector store by node_ids or filters."""
+        self._initialize()
+
+        nodes: List[BaseNode] = []
+
+        if node_ids:
+            placeholders = ",".join(
+                [f":node_id_{i}" for i in range(len(node_ids))]
+            )
+            params = {
+                f"node_id_{i}": nid for i, nid in enumerate(node_ids)
+            }
+            stmt = sqlalchemy.text(
+                f"SELECT text, metadata FROM `{self.table_name}` "
+                f"WHERE node_id IN ({placeholders})"
+            )
+            async with self._async_session() as session:
+                result = await session.execute(stmt, params)
+                for item in result:
+                    meta = item[1]
+                    if isinstance(meta, str):
+                        meta = json.loads(meta)
+                    node = metadata_dict_to_node(meta)
+                    node.set_content(str(item[0]))
+                    nodes.append(node)
+        elif filters:
+            global_param_counter = [0]
+            where_clause, filter_params = self._filters_to_where_clause(
+                filters, global_param_counter
+            )
+            stmt = sqlalchemy.text(
+                f"SELECT text, metadata FROM `{self.table_name}` "
+                f"WHERE {where_clause}"
+            )
+            async with self._async_session() as session:
+                result = await session.execute(stmt, filter_params)
+                for item in result:
+                    meta = item[1]
+                    if isinstance(meta, str):
+                        meta = json.loads(meta)
+                    node = metadata_dict_to_node(meta)
+                    node.set_content(str(item[0]))
+                    nodes.append(node)
+        else:
+            stmt = sqlalchemy.text(
+                f"SELECT text, metadata FROM `{self.table_name}`"
+            )
+            async with self._async_session() as session:
+                result = await session.execute(stmt)
+                for item in result:
+                    meta = item[1]
+                    if isinstance(meta, str):
+                        meta = json.loads(meta)
+                    node = metadata_dict_to_node(meta)
+                    node.set_content(str(item[0]))
+                    nodes.append(node)
+
+        return nodes
+
     # ------------------------------------------------------------------
     # CRUD: delete
     # ------------------------------------------------------------------
@@ -1038,7 +1111,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         with self._session() as session:
             stmt = sqlalchemy.text(
                 f"DELETE FROM `{self.table_name}` "
-                f"WHERE JSON_EXTRACT(metadata, '$.ref_doc_id') = :doc_id"
+                f"WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.ref_doc_id')) "
+                f"= :doc_id"
             )
             session.execute(stmt, {"doc_id": ref_doc_id})
             session.commit()
@@ -1050,7 +1124,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         async with self._async_session() as session:
             stmt = sqlalchemy.text(
                 f"DELETE FROM `{self.table_name}` "
-                f"WHERE JSON_EXTRACT(metadata, '$.ref_doc_id') = :doc_id"
+                f"WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.ref_doc_id')) "
+                f"= :doc_id"
             )
             await session.execute(stmt, {"doc_id": ref_doc_id})
             await session.commit()
@@ -1190,6 +1265,17 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             session.commit()
         self.close()
 
+    async def adrop(self) -> None:
+        """Async drop the table and close connections."""
+        self._initialize()
+
+        async with self._async_session() as session:
+            await session.execute(
+                sqlalchemy.text(f"DROP TABLE IF EXISTS `{self.table_name}`")
+            )
+            await session.commit()
+        await self.aclose()
+
     def close(self) -> None:
         """Close sync and async engines."""
         if not self._is_initialized:
@@ -1243,9 +1329,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             m: HNSW M parameter (3-200). Defaults to the store's default_m.
             distance: Distance function (``"COSINE"``, ``"EUCLIDEAN"``,
                 or ``"INNER_PRODUCT"``). Defaults to the store's method.
+                ``INNER_PRODUCT`` requires v3.
             ef_construction: HNSW build-time candidate list size (5-1000).
                 v3 only; silently ignored on old versions.
         """
+        self._initialize()
         self._validate_identifier(index_name)
         m_val = m or self.default_m
         dist_val = (distance or self.distance_method).upper()
@@ -1253,6 +1341,14 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             raise ValueError(
                 f"Invalid distance function: {dist_val}. "
                 "Must be 'COSINE', 'EUCLIDEAN', or 'INNER_PRODUCT'."
+            )
+        if (
+            dist_val == "INNER_PRODUCT"
+            and not self._capabilities.get("vec_distance", False)
+        ):
+            raise NotSupportedError(
+                "distance='INNER_PRODUCT' requires PolarDB-X v3. "
+                "Use 'COSINE' or 'EUCLIDEAN' for old versions."
             )
         ef_val = ef_construction or self._ef_construction
         ef_clause = ""
@@ -1283,6 +1379,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         ef_construction: Optional[int] = None,
     ) -> None:
         """Async create a vector index."""
+        self._initialize()
         self._validate_identifier(index_name)
         m_val = m or self.default_m
         dist_val = (distance or self.distance_method).upper()
@@ -1290,6 +1387,14 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             raise ValueError(
                 f"Invalid distance function: {dist_val}. "
                 "Must be 'COSINE', 'EUCLIDEAN', or 'INNER_PRODUCT'."
+            )
+        if (
+            dist_val == "INNER_PRODUCT"
+            and not self._capabilities.get("vec_distance", False)
+        ):
+            raise NotSupportedError(
+                "distance='INNER_PRODUCT' requires PolarDB-X v3. "
+                "Use 'COSINE' or 'EUCLIDEAN' for old versions."
             )
         ef_val = ef_construction or self._ef_construction
         ef_clause = ""
@@ -1318,6 +1423,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         Args:
             index_name: Name of the index to drop. If None, auto-detected.
         """
+        self._initialize()
         name = index_name or self._detect_vector_index_name()
         if not name:
             raise ValueError("No vector index name specified or detectable.")
@@ -1339,6 +1445,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         self, index_name: Optional[str] = None
     ) -> None:
         """Async drop a vector index."""
+        self._initialize()
         name = index_name or self._detect_vector_index_name()
         if not name:
             raise ValueError("No vector index name specified or detectable.")
@@ -1362,6 +1469,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
     def get_stats(self) -> Dict[str, Any]:
         """Get vector index runtime statistics (Vidx* status variables)."""
+        self._initialize()
         with self._session() as session:
             result = session.execute(
                 sqlalchemy.text("SHOW GLOBAL STATUS LIKE 'Vidx%'")
@@ -1371,6 +1479,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
     async def aget_stats(self) -> Dict[str, Any]:
         """Async get vector index runtime statistics."""
+        self._initialize()
         async with self._async_session() as session:
             result = await session.execute(
                 sqlalchemy.text("SHOW GLOBAL STATUS LIKE 'Vidx%'")
@@ -1384,6 +1493,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         Note: PolarDB-X OPTIMIZE TABLE returns a result set, so we
         must fetchall() to avoid "Unread result found" errors.
         """
+        self._initialize()
         with self._session() as session:
             result = session.execute(
                 sqlalchemy.text(f"OPTIMIZE TABLE `{self.table_name}`")
@@ -1394,6 +1504,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
     async def aoptimize(self) -> None:
         """Async rebuild the vector index."""
+        self._initialize()
         async with self._async_session() as session:
             result = await session.execute(
                 sqlalchemy.text(f"OPTIMIZE TABLE `{self.table_name}`")
@@ -1421,6 +1532,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         Loads the entire HNSW auxiliary table graph into the shared
         cache to eliminate cold-start latency on the first query.
         """
+        self._initialize()
         self._require_v3("preload_index()")
         with self._session() as session:
             result = session.execute(
@@ -1437,6 +1549,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
     async def apreload_index(self) -> None:
         """Async preload the HNSW vector index (v3 only)."""
+        self._initialize()
         self._require_v3("preload_index()")
         async with self._async_session() as session:
             result = await session.execute(
@@ -1457,6 +1570,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         Returns:
             Dictionary with check results (rows, memory estimate, etc.).
         """
+        self._initialize()
         self._require_v3("preload_check()")
         with self._session() as session:
             result = session.execute(
@@ -1473,6 +1587,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
     async def apreload_check(self) -> Dict[str, Any]:
         """Async check if preloading would fit in cache (v3 only)."""
+        self._initialize()
         self._require_v3("preload_check()")
         async with self._async_session() as session:
             result = await session.execute(
@@ -1491,8 +1606,18 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Check vector index health and return diagnostics (v3 only).
 
         Combines information_schema.VECTOR_INDEXES metadata with
-        EXPLAIN output to provide a comprehensive health report.
+        EXPLAIN and EXPLAIN ANALYZE output to provide a comprehensive
+        health report.
+
+        Returns:
+            Dictionary with keys:
+                - index_info: VECTOR_INDEXES metadata (name, algorithm,
+                  metric, dimension, M, EF_CONSTRUCTION, etc.)
+                - explain: plain EXPLAIN output (index selection info)
+                - explain_analyze: EXPLAIN ANALYZE output with actual
+                  nodes_visited cost (v3 only)
         """
+        self._initialize()
         self._require_v3("explain_index_health()")
         result: Dict[str, Any] = {}
 
@@ -1500,8 +1625,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             # 1. Query VECTOR_INDEXES view for index metadata
             result_set = session.execute(
                 sqlalchemy.text(
-                    "SELECT INDEX_NAME, ALGORITHM, METRIC_TYPE, "
-                    "DIMENSION, M, EF_CONSTRUCTION, QUANTIZE_TYPE "
+                    "SELECT INDEX_NAME, HLINDEX_TABLE_NAME, COLUMN_NAME, "
+                    "ALGORITHM, METRIC_TYPE, DIMENSION, M, "
+                    "EF_CONSTRUCTION, QUANTIZE_TYPE "
                     "FROM information_schema.VECTOR_INDEXES "
                     "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :table"
                 ),
@@ -1529,18 +1655,40 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 dict(r._mapping) for r in result_set.fetchall()
             ]
 
+            # 3. Run EXPLAIN ANALYZE for actual traversal cost
+            #    (nodes_visited shows real ANN cost)
+            try:
+                result_set = session.execute(
+                    sqlalchemy.text(
+                        f"EXPLAIN ANALYZE FORMAT=TREE "
+                        f"SELECT id FROM `{self.table_name}` "
+                        f"ORDER BY {dist_func}(embedding, "
+                        f"VEC_FROMTEXT('{sample_vec}')) LIMIT 10"
+                    )
+                )
+                result["explain_analyze"] = [
+                    dict(r._mapping) for r in result_set.fetchall()
+                ]
+            except Exception as e:
+                _logger.debug(
+                    "EXPLAIN ANALYZE failed (may not be supported): %s", e
+                )
+                result["explain_analyze"] = None
+
         return result
 
     async def aexplain_index_health(self) -> Dict[str, Any]:
         """Async check vector index health (v3 only)."""
+        self._initialize()
         self._require_v3("explain_index_health()")
         result: Dict[str, Any] = {}
 
         async with self._async_session() as session:
             result_set = await session.execute(
                 sqlalchemy.text(
-                    "SELECT INDEX_NAME, ALGORITHM, METRIC_TYPE, "
-                    "DIMENSION, M, EF_CONSTRUCTION, QUANTIZE_TYPE "
+                    "SELECT INDEX_NAME, HLINDEX_TABLE_NAME, COLUMN_NAME, "
+                    "ALGORITHM, METRIC_TYPE, DIMENSION, M, "
+                    "EF_CONSTRUCTION, QUANTIZE_TYPE "
                     "FROM information_schema.VECTOR_INDEXES "
                     "WHERE TABLE_SCHEMA = :schema AND TABLE_NAME = :table"
                 ),
@@ -1566,5 +1714,23 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             result["explain"] = [
                 dict(r._mapping) for r in result_set.fetchall()
             ]
+
+            try:
+                result_set = await session.execute(
+                    sqlalchemy.text(
+                        f"EXPLAIN ANALYZE FORMAT=TREE "
+                        f"SELECT id FROM `{self.table_name}` "
+                        f"ORDER BY {dist_func}(embedding, "
+                        f"VEC_FROMTEXT('{sample_vec}')) LIMIT 10"
+                    )
+                )
+                result["explain_analyze"] = [
+                    dict(r._mapping) for r in result_set.fetchall()
+                ]
+            except Exception as e:
+                _logger.debug(
+                    "EXPLAIN ANALYZE failed (may not be supported): %s", e
+                )
+                result["explain_analyze"] = None
 
         return result
