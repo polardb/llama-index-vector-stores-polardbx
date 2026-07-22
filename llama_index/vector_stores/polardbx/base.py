@@ -17,6 +17,7 @@ import logging
 import re
 from typing import (
     Any,
+    ClassVar,
     Dict,
     List,
     Literal,
@@ -90,8 +91,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
     """
 
-    stores_text: bool = True
-    flat_metadata: bool = False
+    stores_text: ClassVar[bool] = True
+    flat_metadata: ClassVar[bool] = False
 
     connection_string: str
     table_name: str = "llama_index_table"
@@ -311,10 +312,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         results in ``self._capabilities`` for later use.
 
         Detected capabilities:
-            - vec_distance: VEC_DISTANCE() auto-inference function (v3)
+            - vec_distance: VEC_DISTANCE() auto-inference function
             - vec_totext: VEC_TOTEXT() function
-            - vec_dim: VECTOR_DIM() function
-            - vector_indexes_view: information_schema.VECTOR_INDEXES (v3)
+            - vec_dim: VECTOR_DIM() function (v3 indicator)
+            - vector_indexes_view: information_schema.VECTOR_INDEXES
 
         Raises:
             ValueError: If vector index is disabled or vector functions
@@ -363,6 +364,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 raise
 
         # Probe extended capabilities (non-fatal — default to False)
+        # vec_dim (VECTOR_DIM) serves as the v3 indicator: it is present
+        # iff the instance has v3 vector features (EF_CONSTRUCTION DDL,
+        # INNER_PRODUCT, dbms_vidx procedures, etc.).
         caps = {
             "vec_distance": self._probe_vec_distance(),
             "vec_totext": self._probe_function(
@@ -382,11 +386,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Validate INNER_PRODUCT requires v3 support."""
         if (
             self.distance_method == "INNER_PRODUCT"
-            and not self._capabilities.get("vec_distance", False)
+            and not self._capabilities.get("vec_dim", False)
         ):
             raise NotSupportedError(
-                "distance_method='INNER_PRODUCT' requires PolarDB-X v3 "
-                "with VEC_DISTANCE_INNER_PRODUCT support. "
+                "distance_method='INNER_PRODUCT' requires PolarDB-X v3. "
                 "Use 'COSINE' or 'EUCLIDEAN' for old versions."
             )
 
@@ -486,7 +489,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         ef_clause = ""
         if (
             self._ef_construction is not None
-            and self._capabilities.get("vec_distance", False)
+            and self._capabilities.get("vec_dim", False)
         ):
             ef_clause = f" EF_CONSTRUCTION={self._ef_construction}"
 
@@ -1344,7 +1347,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
         if (
             dist_val == "INNER_PRODUCT"
-            and not self._capabilities.get("vec_distance", False)
+            and not self._capabilities.get("vec_dim", False)
         ):
             raise NotSupportedError(
                 "distance='INNER_PRODUCT' requires PolarDB-X v3. "
@@ -1352,7 +1355,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
         ef_val = ef_construction or self._ef_construction
         ef_clause = ""
-        if ef_val is not None and self._capabilities.get("vec_distance", False):
+        if ef_val is not None and self._capabilities.get("vec_dim", False):
             ef_clause = f" EF_CONSTRUCTION={ef_val}"
 
         with self._session() as session:
@@ -1390,7 +1393,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
         if (
             dist_val == "INNER_PRODUCT"
-            and not self._capabilities.get("vec_distance", False)
+            and not self._capabilities.get("vec_dim", False)
         ):
             raise NotSupportedError(
                 "distance='INNER_PRODUCT' requires PolarDB-X v3. "
@@ -1398,7 +1401,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
         ef_val = ef_construction or self._ef_construction
         ef_clause = ""
-        if ef_val is not None and self._capabilities.get("vec_distance", False):
+        if ef_val is not None and self._capabilities.get("vec_dim", False):
             ef_clause = f" EF_CONSTRUCTION={ef_val}"
 
         async with self._async_session() as session:
@@ -1518,8 +1521,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     # ------------------------------------------------------------------
 
     def _require_v3(self, feature: str) -> None:
-        """Raise NotSupportedError if v3 capabilities are not available."""
-        if not self._capabilities.get("vec_distance", False):
+        """Raise NotSupportedError if v3 capabilities are not available.
+
+        Uses ``vec_dim`` (VECTOR_DIM) as the v3 indicator — present iff
+        the instance has v3 vector features enabled.
+        """
+        if not self._capabilities.get("vec_dim", False):
             raise NotSupportedError(
                 f"{feature} requires PolarDB-X v3 with vector index "
                 "support. Current instance does not support v3 vector "

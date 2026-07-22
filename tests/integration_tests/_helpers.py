@@ -6,7 +6,7 @@ import uuid
 from urllib.parse import urlparse
 
 import numpy as np
-from llama_index.core.schema import TextNode
+from llama_index.core.schema import NodeRelationship, RelatedNodeInfo, TextNode
 
 from llama_index.vector_stores.polardbx import PolarDBXVectorStore
 
@@ -115,10 +115,8 @@ def make_nodes(
             metadata=meta,
             embedding=emb.embed_query(text),
         )
-        if ref_doc_ids and i < len(ref_doc_ids):
-            node.ref_doc_id = ref_doc_ids[i]
-        else:
-            node.ref_doc_id = node.node_id
+        ref_id = ref_doc_ids[i] if ref_doc_ids and i < len(ref_doc_ids) else node.node_id
+        node.relationships[NodeRelationship.SOURCE] = RelatedNodeInfo(node_id=ref_id)
         nodes.append(node)
     return nodes
 
@@ -176,5 +174,10 @@ def _drop_table_safely(table_name: str) -> None:
 
 
 def is_v3(store: PolarDBXVectorStore) -> bool:
-    """Check if the connected instance supports v3 vector features."""
-    return store._capabilities.get("vec_distance", False)
+    """Check if the connected instance supports v3 vector features.
+
+    Uses vec_dim (VECTOR_DIM) as the v3 indicator — present iff the
+    instance has v3 vector features (EF_CONSTRUCTION DDL, INNER_PRODUCT,
+    dbms_vidx procedures, etc.).
+    """
+    return store._capabilities.get("vec_dim", False)
