@@ -12,6 +12,7 @@ dev = [
     "pytest==7.2.1",
     "pytest-mock==3.11.1",
     "pytest-asyncio>=0.23.0",
+    "numpy>=1.24.0",
     "ruff==0.11.11",
     "types-Deprecated>=0.1.0",
     "types-PyYAML>=6.0.12.12,<7",
@@ -50,7 +51,6 @@ dependencies = [
     "sqlalchemy>=1.4.0,<3.0.0",
     "aiomysql>=0.2.0",
     "pymysql>=1.0.0",
-    "numpy>=1.24.0",
 ]
 
 [tool.codespell]
