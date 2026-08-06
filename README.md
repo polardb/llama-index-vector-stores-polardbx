@@ -48,18 +48,9 @@ All transaction isolation levels (READ-COMMITTED, REPEATABLE-READ, SERIALIZABLE)
 
 ## Installation
 
-<!-- PyPI publish pending, use local install for now -->
-
-```bash
-# From source (until PyPI release)
-pip install -e .
-```
-
-<!-- Once published to PyPI:
 ```bash
 pip install -U llama-index-vector-stores-polardbx
 ```
--->
 
 ### Optional Dependencies
 
