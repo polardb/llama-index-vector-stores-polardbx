@@ -326,6 +326,7 @@ async def main():
     # v3 monitoring
     stats = await vector_store.aget_stats()
     await vector_store.apreload_index()
+    check = await vector_store.apreload_check()
     health = await vector_store.aexplain_index_health()
 
 asyncio.run(main())

@@ -15,6 +15,7 @@ branches at runtime based on the detected feature set.
 import json
 import logging
 import re
+import threading
 from typing import (
     Any,
     ClassVar,
@@ -110,9 +111,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     _is_initialized: bool = PrivateAttr(default=False)
     _capabilities: Dict[str, bool] = PrivateAttr(default_factory=dict)
     _vector_index_name: Optional[str] = PrivateAttr(default=None)
+    _vector_index_checked: bool = PrivateAttr(default=False)
     _ef_construction: Optional[int] = PrivateAttr(default=None)
     _ssl: bool = PrivateAttr(default=False)
     _ssl_ca: Optional[str] = PrivateAttr(default=None)
+    _lock: Any = PrivateAttr(default_factory=threading.Lock)
 
     # ------------------------------------------------------------------
     # Security: prevent credential leakage in repr/dump
@@ -222,8 +225,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
 
         password_safe = quote_plus(password)
+        user_safe = quote_plus(user)
         connection_string = (
-            f"mysql+pymysql://{user}:{password_safe}@{host}:{port}/{database}"
+            f"mysql+pymysql://{user_safe}:{password_safe}"
+            f"@{host}:{port}/{database}"
         )
 
         super().__init__(
@@ -245,9 +250,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         self._is_initialized = False
         self._capabilities = {}
         self._vector_index_name = vector_index_name
+        self._vector_index_checked = False
         self._ef_construction = ef_construction
         self._ssl = ssl
         self._ssl_ca = ssl_ca
+        self._lock = threading.Lock()
 
         self._initialize()
 
@@ -355,14 +362,24 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         )
 
     def _initialize(self) -> None:
-        """Connect, detect capabilities, and optionally create table."""
+        """Connect, detect capabilities, and optionally create table.
+
+        Uses double-checked locking to ensure thread safety during
+        initialization.  Capability detection always runs (independent
+        of ``perform_setup``); only table creation is gated.
+        """
         if not self._is_initialized:
-            self._connect()
-            if self.perform_setup:
-                self._detect_capabilities()
-                self._validate_distance_method()
-                self._create_table_if_not_exists()
-            self._is_initialized = True
+            with self._lock:
+                if not self._is_initialized:
+                    self._connect()
+                    # Capability detection is independent of table
+                    # creation — always probe so v3 features work
+                    # even when perform_setup=False.
+                    self._detect_capabilities()
+                    self._validate_distance_method()
+                    if self.perform_setup:
+                        self._create_table_if_not_exists()
+                    self._is_initialized = True
 
     # ------------------------------------------------------------------
     # Capability detection (v3 dual-version support)
@@ -601,10 +618,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             FilterOperator.NIN: "NOT IN",
         }
         if operator not in mapping:
-            _logger.warning(
-                "Unsupported operator: %s, fallback to '='", operator
+            raise ValueError(
+                f"Unsupported filter operator: {operator}. "
+                "Supported operators: EQ, NE, GT, GTE, LT, LTE, IN, NIN."
             )
-            return "="
         return mapping[operator]
 
     def _build_filter_clause(
@@ -619,6 +636,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         params: Dict[str, Any] = {}
 
         if filter_.operator in [FilterOperator.IN, FilterOperator.NIN]:
+            if not filter_.value:
+                raise ValueError(
+                    f"Filter '{filter_.key}' uses {filter_.operator} "
+                    "with an empty list, which would generate "
+                    "invalid SQL (IN ())."
+                )
             placeholders = []
             for i in range(len(filter_.value)):
                 param_name = f"param_{global_param_counter[0]}"
@@ -710,6 +733,46 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         )
 
     # ------------------------------------------------------------------
+    # Distance-to-similarity conversion & metadata parsing
+    # ------------------------------------------------------------------
+
+    def _distance_to_similarity(self, distance: float) -> float:
+        """Convert a raw distance value to a similarity score.
+
+        The conversion depends on ``distance_method``:
+        - COSINE: ``1 - distance``  (range [-1, 1])
+        - EUCLIDEAN: ``1 / (1 + distance)``  (range (0, 1])
+        - INNER_PRODUCT: ``-distance``  (distance is -dot_product)
+        """
+        if self.distance_method == "COSINE":
+            return 1.0 - distance
+        elif self.distance_method == "EUCLIDEAN":
+            return 1.0 / (1.0 + max(0.0, distance))
+        elif self.distance_method == "INNER_PRODUCT":
+            return -distance
+        return 1.0 - distance
+
+    @staticmethod
+    def _parse_metadata(raw: Any) -> dict:
+        """Parse metadata from a DB row value.
+
+        Handles JSON strings, dicts, and corrupted values gracefully.
+        """
+        if isinstance(raw, dict):
+            return raw
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                _logger.warning(
+                    "Corrupted metadata JSON in database row, "
+                    "using empty dict. Raw: %s",
+                    raw[:200],
+                )
+                return {}
+        return {}
+
+    # ------------------------------------------------------------------
     # Index hint & ef_search helpers
     # ------------------------------------------------------------------
 
@@ -718,9 +781,14 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         v3 path: query information_schema.VECTOR_INDEXES.
         Fallback: parse SHOW CREATE TABLE with regex.
+
+        Caches the result (including "not found") via
+        ``_vector_index_checked`` to avoid repeated DB probes.
         """
         if self._vector_index_name is not None:
             return self._vector_index_name
+        if self._vector_index_checked:
+            return None
 
         from sqlalchemy import text
 
@@ -762,6 +830,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                         return self._vector_index_name
         except Exception as e:
             _logger.debug("Failed to detect vector index name: %s", e)
+        self._vector_index_checked = True
         return None
 
     def _build_index_hint(self, search_type: Optional[str]) -> str:
@@ -815,42 +884,51 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         Uses UPSERT (ON DUPLICATE KEY UPDATE) on the ``node_id``
         unique index so re-adding a node updates rather than duplicates.
+
+        Args:
+            nodes: List of nodes to add.
+            batch_size: Number of nodes per transaction commit.
+                Defaults to 500.  Larger values may improve throughput
+                but increase memory usage and lock duration.
         """
         self._initialize()
 
         if not nodes:
             return []
 
+        batch_size = add_kwargs.get("batch_size", 500)
         ids: List[str] = []
-        with self._session() as session:
-            for node in nodes:
-                ids.append(node.node_id)
-                item = self._node_to_table_row(node)
+        for start in range(0, len(nodes), batch_size):
+            batch = nodes[start : start + batch_size]
+            with self._session() as session:
+                for node in batch:
+                    ids.append(node.node_id)
+                    item = self._node_to_table_row(node)
 
-                stmt = sqlalchemy.text(f"""
-                INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
-                VALUES (
-                    UUID(),
-                    :node_id,
-                    :text,
-                    VEC_FROMTEXT(:embedding),
-                    :metadata
-                )
-                ON DUPLICATE KEY UPDATE
-                    text = VALUES(text),
-                    embedding = VALUES(embedding),
-                    metadata = VALUES(metadata)
-                """)
-                session.execute(
-                    stmt,
-                    {
-                        "node_id": item["node_id"],
-                        "text": item["text"],
-                        "embedding": json.dumps(item["embedding"]),
-                        "metadata": json.dumps(item["metadata"]),
-                    },
-                )
-            session.commit()
+                    stmt = sqlalchemy.text(f"""
+                    INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
+                    VALUES (
+                        UUID(),
+                        :node_id,
+                        :text,
+                        VEC_FROMTEXT(:embedding),
+                        :metadata
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        text = VALUES(text),
+                        embedding = VALUES(embedding),
+                        metadata = VALUES(metadata)
+                    """)
+                    session.execute(
+                        stmt,
+                        {
+                            "node_id": item["node_id"],
+                            "text": item["text"],
+                            "embedding": json.dumps(item["embedding"]),
+                            "metadata": json.dumps(item["metadata"]),
+                        },
+                    )
+                session.commit()
         return ids
 
     async def async_add(
@@ -858,42 +936,51 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         nodes: Sequence[BaseNode],
         **kwargs: Any,
     ) -> List[str]:
-        """Async add nodes to the vector store."""
+        """Async add nodes to the vector store.
+
+        Args:
+            nodes: Sequence of nodes to add.
+            batch_size: Number of nodes per transaction commit.
+                Defaults to 500.
+        """
         self._initialize()
 
         if not nodes:
             return []
 
+        batch_size = kwargs.get("batch_size", 500)
         ids: List[str] = []
-        async with self._async_session() as session:
-            for node in nodes:
-                ids.append(node.node_id)
-                item = self._node_to_table_row(node)
+        for start in range(0, len(nodes), batch_size):
+            batch = nodes[start : start + batch_size]
+            async with self._async_session() as session:
+                for node in batch:
+                    ids.append(node.node_id)
+                    item = self._node_to_table_row(node)
 
-                stmt = sqlalchemy.text(f"""
-                INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
-                VALUES (
-                    UUID(),
-                    :node_id,
-                    :text,
-                    VEC_FROMTEXT(:embedding),
-                    :metadata
-                )
-                ON DUPLICATE KEY UPDATE
-                    text = VALUES(text),
-                    embedding = VALUES(embedding),
-                    metadata = VALUES(metadata)
-                """)
-                await session.execute(
-                    stmt,
-                    {
-                        "node_id": item["node_id"],
-                        "text": item["text"],
-                        "embedding": json.dumps(item["embedding"]),
-                        "metadata": json.dumps(item["metadata"]),
-                    },
-                )
-            await session.commit()
+                    stmt = sqlalchemy.text(f"""
+                    INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
+                    VALUES (
+                        UUID(),
+                        :node_id,
+                        :text,
+                        VEC_FROMTEXT(:embedding),
+                        :metadata
+                    )
+                    ON DUPLICATE KEY UPDATE
+                        text = VALUES(text),
+                        embedding = VALUES(embedding),
+                        metadata = VALUES(metadata)
+                    """)
+                    await session.execute(
+                        stmt,
+                        {
+                            "node_id": item["node_id"],
+                            "text": item["text"],
+                            "embedding": json.dumps(item["embedding"]),
+                            "metadata": json.dumps(item["metadata"]),
+                        },
+                    )
+                await session.commit()
         return ids
 
     # ------------------------------------------------------------------
@@ -964,15 +1051,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         rows = []
         for item in results:
-            meta = item[2]
-            if isinstance(meta, str):
-                meta = json.loads(meta)
+            meta = self._parse_metadata(item[2])
             rows.append(
                 DBEmbeddingRow(
                     node_id=item[0],
                     text=item[1],
                     metadata=meta,
-                    similarity=(1 - item[3]) if item[3] is not None else 0,
+                    similarity=self._distance_to_similarity(item[3])
+                    if item[3] is not None
+                    else 0.0,
                 )
             )
 
@@ -1035,15 +1122,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         rows = []
         for item in results:
-            meta = item[2]
-            if isinstance(meta, str):
-                meta = json.loads(meta)
+            meta = self._parse_metadata(item[2])
             rows.append(
                 DBEmbeddingRow(
                     node_id=item[0],
                     text=item[1],
                     metadata=meta,
-                    similarity=(1 - item[3]) if item[3] is not None else 0,
+                    similarity=self._distance_to_similarity(item[3])
+                    if item[3] is not None
+                    else 0.0,
                 )
             )
 
@@ -1064,25 +1151,28 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         nodes: List[BaseNode] = []
 
         if node_ids:
-            placeholders = ",".join(
-                [f":node_id_{i}" for i in range(len(node_ids))]
-            )
-            params = {
-                f"node_id_{i}": nid for i, nid in enumerate(node_ids)
-            }
-            stmt = sqlalchemy.text(
-                f"SELECT text, metadata FROM `{self.table_name}` "
-                f"WHERE node_id IN ({placeholders})"
-            )
+            # Chunk large node_ids to avoid SQL length limits
+            chunk_size = 1000
             with self._session() as session:
-                result = session.execute(stmt, params)
-                for item in result:
-                    meta = item[1]
-                    if isinstance(meta, str):
-                        meta = json.loads(meta)
-                    node = metadata_dict_to_node(meta)
-                    node.set_content(str(item[0]))
-                    nodes.append(node)
+                for start in range(0, len(node_ids), chunk_size):
+                    chunk = node_ids[start : start + chunk_size]
+                    placeholders = ",".join(
+                        [f":node_id_{i}" for i in range(len(chunk))]
+                    )
+                    params = {
+                        f"node_id_{i}": nid
+                        for i, nid in enumerate(chunk)
+                    }
+                    stmt = sqlalchemy.text(
+                        f"SELECT text, metadata FROM `{self.table_name}` "
+                        f"WHERE node_id IN ({placeholders})"
+                    )
+                    result = session.execute(stmt, params)
+                    for item in result:
+                        meta = self._parse_metadata(item[1])
+                        node = metadata_dict_to_node(meta)
+                        node.set_content(str(item[0]))
+                        nodes.append(node)
         elif filters:
             global_param_counter = [0]
             where_clause, filter_params = self._filters_to_where_clause(
@@ -1095,22 +1185,23 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             with self._session() as session:
                 result = session.execute(stmt, filter_params)
                 for item in result:
-                    meta = item[1]
-                    if isinstance(meta, str):
-                        meta = json.loads(meta)
+                    meta = self._parse_metadata(item[1])
                     node = metadata_dict_to_node(meta)
                     node.set_content(str(item[0]))
                     nodes.append(node)
         else:
             stmt = sqlalchemy.text(
-                f"SELECT text, metadata FROM `{self.table_name}`"
+                f"SELECT text, metadata FROM `{self.table_name}` "
+                f"LIMIT 10000"
+            )
+            _logger.warning(
+                "get_nodes() called without node_ids or filters; "
+                "results capped at 10000 rows."
             )
             with self._session() as session:
                 result = session.execute(stmt)
                 for item in result:
-                    meta = item[1]
-                    if isinstance(meta, str):
-                        meta = json.loads(meta)
+                    meta = self._parse_metadata(item[1])
                     node = metadata_dict_to_node(meta)
                     node.set_content(str(item[0]))
                     nodes.append(node)
@@ -1128,25 +1219,28 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         nodes: List[BaseNode] = []
 
         if node_ids:
-            placeholders = ",".join(
-                [f":node_id_{i}" for i in range(len(node_ids))]
-            )
-            params = {
-                f"node_id_{i}": nid for i, nid in enumerate(node_ids)
-            }
-            stmt = sqlalchemy.text(
-                f"SELECT text, metadata FROM `{self.table_name}` "
-                f"WHERE node_id IN ({placeholders})"
-            )
+            # Chunk large node_ids to avoid SQL length limits
+            chunk_size = 1000
             async with self._async_session() as session:
-                result = await session.execute(stmt, params)
-                for item in result:
-                    meta = item[1]
-                    if isinstance(meta, str):
-                        meta = json.loads(meta)
-                    node = metadata_dict_to_node(meta)
-                    node.set_content(str(item[0]))
-                    nodes.append(node)
+                for start in range(0, len(node_ids), chunk_size):
+                    chunk = node_ids[start : start + chunk_size]
+                    placeholders = ",".join(
+                        [f":node_id_{i}" for i in range(len(chunk))]
+                    )
+                    params = {
+                        f"node_id_{i}": nid
+                        for i, nid in enumerate(chunk)
+                    }
+                    stmt = sqlalchemy.text(
+                        f"SELECT text, metadata FROM `{self.table_name}` "
+                        f"WHERE node_id IN ({placeholders})"
+                    )
+                    result = await session.execute(stmt, params)
+                    for item in result:
+                        meta = self._parse_metadata(item[1])
+                        node = metadata_dict_to_node(meta)
+                        node.set_content(str(item[0]))
+                        nodes.append(node)
         elif filters:
             global_param_counter = [0]
             where_clause, filter_params = self._filters_to_where_clause(
@@ -1159,22 +1253,23 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             async with self._async_session() as session:
                 result = await session.execute(stmt, filter_params)
                 for item in result:
-                    meta = item[1]
-                    if isinstance(meta, str):
-                        meta = json.loads(meta)
+                    meta = self._parse_metadata(item[1])
                     node = metadata_dict_to_node(meta)
                     node.set_content(str(item[0]))
                     nodes.append(node)
         else:
             stmt = sqlalchemy.text(
-                f"SELECT text, metadata FROM `{self.table_name}`"
+                f"SELECT text, metadata FROM `{self.table_name}` "
+                f"LIMIT 10000"
+            )
+            _logger.warning(
+                "aget_nodes() called without node_ids or filters; "
+                "results capped at 10000 rows."
             )
             async with self._async_session() as session:
                 result = await session.execute(stmt)
                 for item in result:
-                    meta = item[1]
-                    if isinstance(meta, str):
-                        meta = json.loads(meta)
+                    meta = self._parse_metadata(item[1])
                     node = metadata_dict_to_node(meta)
                     node.set_content(str(item[0]))
                     nodes.append(node)
@@ -1222,17 +1317,21 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         with self._session() as session:
             if node_ids:
-                placeholders = ",".join(
-                    [f":node_id_{i}" for i in range(len(node_ids))]
-                )
-                params = {
-                    f"node_id_{i}": nid for i, nid in enumerate(node_ids)
-                }
-                stmt = sqlalchemy.text(
-                    f"DELETE FROM `{self.table_name}` "
-                    f"WHERE node_id IN ({placeholders})"
-                )
-                session.execute(stmt, params)
+                # Chunk large node_ids to avoid SQL length limits
+                chunk_size = 1000
+                for start in range(0, len(node_ids), chunk_size):
+                    chunk = node_ids[start : start + chunk_size]
+                    placeholders = ",".join(
+                        [f":node_id_{i}" for i in range(len(chunk))]
+                    )
+                    params = {
+                        f"node_id_{i}": nid for i, nid in enumerate(chunk)
+                    }
+                    stmt = sqlalchemy.text(
+                        f"DELETE FROM `{self.table_name}` "
+                        f"WHERE node_id IN ({placeholders})"
+                    )
+                    session.execute(stmt, params)
                 session.commit()
             elif filters:
                 global_param_counter = [0]
@@ -1257,17 +1356,21 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         async with self._async_session() as session:
             if node_ids:
-                placeholders = ",".join(
-                    [f":node_id_{i}" for i in range(len(node_ids))]
-                )
-                params = {
-                    f"node_id_{i}": nid for i, nid in enumerate(node_ids)
-                }
-                stmt = sqlalchemy.text(
-                    f"DELETE FROM `{self.table_name}` "
-                    f"WHERE node_id IN ({placeholders})"
-                )
-                await session.execute(stmt, params)
+                # Chunk large node_ids to avoid SQL length limits
+                chunk_size = 1000
+                for start in range(0, len(node_ids), chunk_size):
+                    chunk = node_ids[start : start + chunk_size]
+                    placeholders = ",".join(
+                        [f":node_id_{i}" for i in range(len(chunk))]
+                    )
+                    params = {
+                        f"node_id_{i}": nid for i, nid in enumerate(chunk)
+                    }
+                    stmt = sqlalchemy.text(
+                        f"DELETE FROM `{self.table_name}` "
+                        f"WHERE node_id IN ({placeholders})"
+                    )
+                    await session.execute(stmt, params)
                 await session.commit()
             elif filters:
                 global_param_counter = [0]
@@ -1529,6 +1632,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
             session.commit()
         self._vector_index_name = None
+        self._vector_index_checked = False
         _logger.info(
             "Vector index '%s' dropped from table %s",
             name,
@@ -1552,6 +1656,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
             await session.commit()
         self._vector_index_name = None
+        self._vector_index_checked = False
         _logger.info(
             "Vector index '%s' dropped from table %s",
             name,
@@ -1736,6 +1841,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             if rows:
                 result["index_info"] = dict(rows[0]._mapping)
                 dim = rows[0]._mapping.get("DIMENSION", self.embed_dim)
+                # Clamp dim to avoid generating huge SQL vectors
+                dim = max(1, min(int(dim), 4096))
             else:
                 result["index_info"] = None
                 dim = self.embed_dim
@@ -1797,6 +1904,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             if rows:
                 result["index_info"] = dict(rows[0]._mapping)
                 dim = rows[0]._mapping.get("DIMENSION", self.embed_dim)
+                # Clamp dim to avoid generating huge SQL vectors
+                dim = max(1, min(int(dim), 4096))
             else:
                 result["index_info"] = None
                 dim = self.embed_dim
