@@ -12,7 +12,8 @@ PolarDB-X is a cloud-native distributed database system developed by Alibaba Clo
 
 - Python 3.10+
 - PolarDB-X with vector index support
-- SQLAlchemy: `sqlalchemy>=1.4.0` (included in package dependencies)
+- LlamaIndex core: `llama-index-core>=0.13.0,<0.15` (included in package dependencies)
+- SQLAlchemy: `sqlalchemy>=2.0.0` (included in package dependencies)
 - Async support: `aiomysql>=0.2.0` (included in package dependencies)
 - MySQL driver: `pymysql>=1.0.0` (included in package dependencies)
 
@@ -34,13 +35,13 @@ All transaction isolation levels (READ-COMMITTED, REPEATABLE-READ, SERIALIZABLE)
 - **Native Vector Storage**: Store embeddings using PolarDB-X's native `VECTOR(N)` data type
 - **HNSW Index**: Efficient approximate nearest neighbor search with configurable `M` and `EF_CONSTRUCTION` parameters
 - **Multiple Distance Metrics**: Support for Cosine, Euclidean, and Inner Product distance (v3)
-- **Similarity Search**: Perform efficient similarity searches with score thresholds
-- **Metadata Filtering**: Filter search results by metadata with rich operators (`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`, `$like`)
+- **Similarity Search**: Perform efficient similarity searches with configurable top-k
+- **Metadata Filtering**: Filter search results by metadata with rich operators (`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`)
 - **Dynamic Index Management**: Create, drop, and rebuild vector indexes at runtime without recreating tables
 - **Search Mode Control**: Switch between ANN (index-accelerated) and KNN (full-scan) modes per query
 - **Per-Query Tuning**: Adjust `ef_search` on a per-query basis for accuracy/latency trade-offs
 - **Index Health Monitoring**: Runtime statistics, index health diagnostics, and preload checks (v3)
-- **Batch Operations**: Efficient batch insert and bulk upsert with configurable batch size
+- **Batch Operations**: Batch insert with UPSERT support within a single transaction
 - **Full Async Support**: All public methods have async equivalents (`async_add`, `aquery`, etc.)
 - **Dual-Version Compatibility**: Automatically detects database capabilities and adapts SQL accordingly
 - **Connection Pooling**: Built-in SQLAlchemy Engine with connection pooling
@@ -96,7 +97,6 @@ vector_store = PolarDBXVectorStore(
     table_name="my_vectors",
     embed_dim=1536,
     distance_method="COSINE",  # or "EUCLIDEAN", "INNER_PRODUCT" (v3 only)
-    default_m=16,  # HNSW index M parameter (3-200)
 )
 
 # Create index from documents
@@ -110,6 +110,25 @@ index = VectorStoreIndex.from_documents(
 query_engine = index.as_query_engine()
 response = query_engine.query("What is PolarDB-X?")
 print(response)
+```
+
+### Using from_params Factory Method
+
+```python
+from llama_index.vector_stores.polardbx import PolarDBXVectorStore
+
+vector_store = PolarDBXVectorStore.from_params(
+    host="your-polardbx-host",
+    port=3306,
+    user="your-user",
+    password="your-password",
+    database="your-database",
+    table_name="my_vectors",
+    embed_dim=1536,
+    distance_method="COSINE",
+    ssl=True,           # Enable TLS
+    ssl_ca="/path/to/ca.pem",  # CA certificate
+)
 ```
 
 ### Using DashScope Embeddings
@@ -129,7 +148,7 @@ vector_store = PolarDBXVectorStore(
     user="your-user",
     password="your-password",
     database="your-database",
-    table_name="langchain_vectors",
+    table_name="my_vectors",
     embed_dim=1024,
 )
 ```
@@ -160,7 +179,7 @@ nodes = [
 ids = vector_store.add(nodes)
 
 # Query
-from llama_index.core.vector_stores.types import VectorStoreQuery
+from llama_index.core.vector_stores import VectorStoreQuery
 query = VectorStoreQuery(
     query_embedding=[0.1, 0.2, ...],
     similarity_top_k=5,
@@ -173,7 +192,7 @@ for node, score in zip(result.nodes, result.similarities):
 ### Search with Metadata Filter
 
 ```python
-from llama_index.core.vector_stores.types import (
+from llama_index.core.vector_stores import (
     MetadataFilter,
     MetadataFilters,
     FilterOperator,
@@ -324,10 +343,12 @@ asyncio.run(main())
 | `table_name` | str | `"llama_index_table"` | Table name for vector storage |
 | `embed_dim` | int | 1536 | Embedding dimension |
 | `distance_method` | str | `"COSINE"` | Distance function: `"COSINE"`, `"EUCLIDEAN"`, or `"INNER_PRODUCT"` (v3) |
-| `default_m` | int | 6 | HNSW index M parameter (3-200) |
+| `default_m` | int | 6 | HNSW index M parameter (DB allows 3-200; client validates positive int only) |
 | `perform_setup` | bool | True | Whether to auto-create table on init |
 | `debug` | bool | False | Enable SQLAlchemy echo mode |
-| `ef_construction` | int | None | HNSW build-time candidate list size (5-1000, v3 only) |
+| `ef_construction` | int | None | HNSW build-time candidate list size (DB allows 5-1000, v3 only; client validates positive int only) |
+| `ssl` | bool | False | Enable TLS/SSL encryption |
+| `ssl_ca` | str | None | Path to CA certificate for SSL verification (only effective when `ssl=True`) |
 | `vector_index_name` | str | None | Vector index name for FORCE INDEX hints (auto-detected if None) |
 
 ## PolarDB-X Vector Functions Used
@@ -340,7 +361,7 @@ This integration uses PolarDB-X's native vector functions:
 - `VEC_DISTANCE(v1, v2)` — Auto-inferred distance function (v3)
 - `VEC_DISTANCE_COSINE(v1, v2)` — Cosine distance (old versions)
 - `VEC_DISTANCE_EUCLIDEAN(v1, v2)` — Euclidean distance (old versions)
-- `VEC_DISTANCE_INNER_PRODUCT(v1, v2)` — Inner product distance (old versions)
+- `VEC_DISTANCE_INNER_PRODUCT(v1, v2)` — Inner product distance (used when v3 auto-inference unavailable; INNER_PRODUCT distance itself requires v3)
 - `VECTOR_DIM(v)` — Get vector dimension (v3)
 - `VECTOR INDEX (col) M=N DISTANCE=COSINE` — HNSW vector index DDL
 - `EF_CONSTRUCTION=N` — HNSW build-time parameter in DDL (v3)
@@ -349,6 +370,19 @@ This integration uses PolarDB-X's native vector functions:
 - `CALL dbms_vidx.preload(db, table, col)` — Preload index into cache (v3)
 - `CALL dbms_vidx.preload_check(db, table, col)` — Check preload feasibility (v3)
 - `information_schema.VECTOR_INDEXES` — Vector index metadata view (v3)
+
+## Error Handling
+
+When using features that require PolarDB-X v3 (e.g. `INNER_PRODUCT` distance, `preload_index`, `explain_index_health`), a `NotSupportedError` is raised on older versions:
+
+```python
+from llama_index.vector_stores.polardbx import PolarDBXVectorStore, NotSupportedError
+
+try:
+    vector_store.preload_index()
+except NotSupportedError as e:
+    print(f"Feature not supported: {e}")
+```
 
 ## Development
 
