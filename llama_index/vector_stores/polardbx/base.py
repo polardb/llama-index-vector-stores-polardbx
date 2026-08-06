@@ -916,6 +916,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         if query.mode != VectorStoreQueryMode.DEFAULT:
             raise NotImplementedError(f"Query mode {query.mode} not available.")
 
+        if query.query_embedding is None:
+            raise ValueError(
+                "query.query_embedding is None. Ensure the embedding "
+                "model is properly configured (e.g. "
+                "Settings.embed_model = ...)."
+            )
+
         self._initialize()
 
         ef_search = kwargs.get("ef_search")
@@ -979,6 +986,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Async query the vector store."""
         if query.mode != VectorStoreQueryMode.DEFAULT:
             raise NotImplementedError(f"Query mode {query.mode} not available.")
+
+        if query.query_embedding is None:
+            raise ValueError(
+                "query.query_embedding is None. Ensure the embedding "
+                "model is properly configured (e.g. "
+                "Settings.embed_model = ...)."
+            )
 
         self._initialize()
 
@@ -1353,19 +1367,31 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             import asyncio
 
             try:
-                loop = asyncio.get_event_loop()
-                if not loop.is_running():
-                    asyncio.run(self._async_engine.dispose())
-                else:
-                    import concurrent.futures
+                asyncio.get_running_loop()
+                # We're inside a running event loop — use a thread to
+                # dispose the async engine without blocking the loop.
+                import concurrent.futures
 
-                    with concurrent.futures.ThreadPoolExecutor() as executor:
-                        future = executor.submit(
-                            asyncio.run, self._async_engine.dispose()
-                        )
-                        future.result()
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    future = executor.submit(
+                        asyncio.run, self._async_engine.dispose()
+                    )
+                    future.result()
             except RuntimeError:
-                asyncio.run(self._async_engine.dispose())
+                # No running event loop — safe to use asyncio.run().
+                try:
+                    asyncio.run(self._async_engine.dispose())
+                except RuntimeError:
+                    # The event loop may have been closed (e.g. after
+                    # pytest-asyncio finishes).  Create a fresh one.
+                    loop = asyncio.new_event_loop()
+                    try:
+                        loop.run_until_complete(
+                            self._async_engine.dispose()
+                        )
+                    finally:
+                        loop.close()
+                        asyncio.set_event_loop(None)
         self._is_initialized = False
 
     async def aclose(self) -> None:
