@@ -29,7 +29,7 @@ from urllib.parse import quote_plus
 
 import sqlalchemy
 import sqlalchemy.ext.asyncio
-from llama_index.core.bridge.pydantic import PrivateAttr
+from llama_index.core.bridge.pydantic import PrivateAttr, SecretStr
 from llama_index.core.schema import BaseNode, MetadataMode
 from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
@@ -94,7 +94,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     stores_text: ClassVar[bool] = True
     flat_metadata: ClassVar[bool] = False
 
-    connection_string: str
+    connection_string: SecretStr
     table_name: str = "llama_index_table"
     database: str
     embed_dim: int = 1536
@@ -111,6 +111,19 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     _capabilities: Dict[str, bool] = PrivateAttr(default_factory=dict)
     _vector_index_name: Optional[str] = PrivateAttr(default=None)
     _ef_construction: Optional[int] = PrivateAttr(default=None)
+    _ssl: bool = PrivateAttr(default=False)
+    _ssl_ca: Optional[str] = PrivateAttr(default=None)
+
+    # ------------------------------------------------------------------
+    # Security: prevent credential leakage in repr/dump
+    # ------------------------------------------------------------------
+
+    def __repr_args__(self):
+        """Exclude connection_string from repr to prevent password leakage."""
+        return [
+            (k, v) for k, v in super().__repr_args__()
+            if k != "connection_string"
+        ]
 
     # ------------------------------------------------------------------
     # Validation helpers
@@ -132,6 +145,22 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
         return value
 
+    @staticmethod
+    def _validate_metadata_key(key: str) -> str:
+        """Validate metadata key for safe JSON path usage.
+
+        Only alphanumeric characters, underscores, and dots are allowed
+        to prevent JSON path injection in JSON_EXTRACT expressions.
+        """
+        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_.]*$", key):
+            raise ValueError(
+                f"Invalid metadata key: {key!r}. "
+                "Only alphanumeric characters, underscores, "
+                "and dots are allowed, starting with a letter "
+                "or underscore."
+            )
+        return key
+
     # ------------------------------------------------------------------
     # Constructor & factory
     # ------------------------------------------------------------------
@@ -151,6 +180,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         debug: bool = False,
         ef_construction: Optional[int] = None,
         vector_index_name: Optional[str] = None,
+        ssl: bool = False,
+        ssl_ca: Optional[str] = None,
     ) -> None:
         """Initialize the PolarDB-X vector store.
 
@@ -175,6 +206,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 Defaults to None (use DN default of 10).
             vector_index_name: Name of the vector index for FORCE INDEX
                 hints. If None, auto-detected on first use.
+            ssl: Enable TLS/SSL encryption. Defaults to False.
+            ssl_ca: Path to CA certificate for SSL verification.
+                Only effective when ``ssl=True``. Defaults to None.
         """
         self._validate_identifier(table_name)
         self._validate_identifier(database)
@@ -212,6 +246,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         self._capabilities = {}
         self._vector_index_name = vector_index_name
         self._ef_construction = ef_construction
+        self._ssl = ssl
+        self._ssl_ca = ssl_ca
 
         self._initialize()
 
@@ -235,6 +271,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         debug: bool = False,
         ef_construction: Optional[int] = None,
         vector_index_name: Optional[str] = None,
+        ssl: bool = False,
+        ssl_ca: Optional[str] = None,
     ) -> "PolarDBXVectorStore":
         """Construct from parameters (factory method)."""
         return cls(
@@ -251,6 +289,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             debug=debug,
             ef_construction=ef_construction,
             vector_index_name=vector_index_name,
+            ssl=ssl,
+            ssl_ca=ssl_ca,
         )
 
     # ------------------------------------------------------------------
@@ -273,17 +313,40 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         )
         from sqlalchemy.orm import sessionmaker
 
+        if self.debug:
+            _logger.warning(
+                "Debug mode enabled — SQL statements will be logged. "
+                "Do NOT use in production."
+            )
+
+        connect_args: Dict[str, Any] = {}
+        if self._ssl:
+            connect_args["ssl"] = (
+                {"ca": self._ssl_ca} if self._ssl_ca else True
+            )
+
+        conn_str = self.connection_string.get_secret_value()
         self._engine = create_engine(
-            self.connection_string,
+            conn_str,
             echo=self.debug,
+            pool_size=5,
+            max_overflow=10,
+            pool_timeout=30,
+            pool_recycle=3600,
+            connect_args=connect_args,
         )
 
-        async_connection_string = self.connection_string.replace(
+        async_conn_str = conn_str.replace(
             "mysql+pymysql://", "mysql+aiomysql://"
         )
         self._async_engine = create_async_engine(
-            async_connection_string,
+            async_conn_str,
             echo=self.debug,
+            pool_size=5,
+            max_overflow=10,
+            pool_timeout=30,
+            pool_recycle=3600,
+            connect_args=connect_args,
         )
 
         self._session = sessionmaker(self._engine)
@@ -552,6 +615,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         Uses JSON_UNQUOTE(JSON_EXTRACT(...)) instead of JSON_VALUE
         because PolarDB-X does not support the JSON_VALUE function.
         """
+        self._validate_metadata_key(filter_.key)
         params: Dict[str, Any] = {}
 
         if filter_.operator in [FilterOperator.IN, FilterOperator.NIN]:
@@ -1430,6 +1494,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         name = index_name or self._detect_vector_index_name()
         if not name:
             raise ValueError("No vector index name specified or detectable.")
+        self._validate_identifier(name)
         with self._session() as session:
             session.execute(
                 sqlalchemy.text(
@@ -1452,6 +1517,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         name = index_name or self._detect_vector_index_name()
         if not name:
             raise ValueError("No vector index name specified or detectable.")
+        self._validate_identifier(name)
         async with self._async_session() as session:
             await session.execute(
                 sqlalchemy.text(

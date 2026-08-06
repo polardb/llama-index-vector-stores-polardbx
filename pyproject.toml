@@ -48,7 +48,7 @@ classifiers = [
 ]
 dependencies = [
     "llama-index-core>=0.13.0,<0.15",
-    "sqlalchemy>=1.4.0,<3.0.0",
+    "sqlalchemy>=2.0.0,<3.0.0",
     "aiomysql>=0.2.0",
     "pymysql>=1.0.0",
 ]
