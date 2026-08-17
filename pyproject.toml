@@ -53,6 +53,11 @@ dependencies = [
     "pymysql>=1.0.0",
 ]
 
+[project.urls]
+Homepage = "https://github.com/polardb/llama-index-vector-stores-polardbx"
+Repository = "https://github.com/polardb/llama-index-vector-stores-polardbx"
+Issues = "https://github.com/polardb/llama-index-vector-stores-polardbx/issues"
+
 [tool.codespell]
 check-filenames = true
 check-hidden = true
