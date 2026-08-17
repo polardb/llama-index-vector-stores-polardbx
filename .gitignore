@@ -30,6 +30,9 @@ htmlcov/
 .env
 .env.local
 
+# Build tools
+uv.lock
+
 # OS
 .DS_Store
 Thumbs.db
