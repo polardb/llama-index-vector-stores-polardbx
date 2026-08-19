@@ -31,7 +31,7 @@ from urllib.parse import quote_plus
 
 import sqlalchemy
 import sqlalchemy.ext.asyncio
-from llama_index.core.bridge.pydantic import PrivateAttr, SecretStr
+from llama_index.core.bridge.pydantic import ConfigDict, PrivateAttr, SecretStr
 from llama_index.core.schema import BaseNode, MetadataMode
 from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
@@ -143,6 +143,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
     """
 
+    # S2: Freeze model fields to prevent post-init SQL injection via
+    # table_name/database mutation. PrivateAttr values (engine, session,
+    # etc.) are not affected by frozen and remain mutable.
+    model_config = ConfigDict(frozen=True)
+
     stores_text: bool = True
     flat_metadata: bool = False
 
@@ -189,8 +194,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     @staticmethod
     def _validate_identifier(name: str) -> str:
         """Validate a SQL identifier (table name, index name, etc.)."""
-        if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
-            raise ValueError(f"Invalid identifier: {name}")
+        if not name or not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", name):
+            raise ValueError(f"Invalid identifier: {name!r}")
+        if len(name) > 64:
+            raise ValueError(
+                f"Identifier too long: {name!r}. Maximum length is 64 characters."
+            )
         return name
 
     @staticmethod
@@ -376,10 +385,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
         _pcolumn = partition_column or "id"
         if _pby and _pcolumn != "id":
-            from llama_index.vector_stores.polardbx._partition import (
-                _validate_identifier as _validate_id,
+            # W4: Vector table schema is fixed (id, node_id, text,
+            # metadata, embedding). PolarDB-X requires the partition key
+            # to be part of every unique index. The only unique index is
+            # PRIMARY KEY(id), so partition_column must be "id".
+            raise ValueError(
+                "For vector tables, partition_column must be 'id'. "
+                "The vector table schema only supports partitioning on "
+                "the primary key column."
             )
-            _validate_id(_pcolumn, "partition column")
 
         password_safe = quote_plus(password)
         user_safe = quote_plus(user)
@@ -731,8 +745,33 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         caps["vector_indexes_view"] = self._probe_table_exists(
             "information_schema", "VECTOR_INDEXES"
         )
+        caps["dbms_vidx"] = self._probe_dbms_vidx()
         self._capabilities = caps
         _logger.info("Detected capabilities: %s", self._capabilities)
+
+    def _probe_dbms_vidx(self) -> bool:
+        """Probe whether dbms_vidx stored procedures exist.
+
+        Tries calling ``dbms_vidx.preload_check`` with dummy args.
+        If the error is ``ERR_PROCEDURE_NOT_FOUND``, the procedures are
+        absent. Any other error (invalid args, table not found, etc.)
+        means the procedure exists.
+        """
+        from sqlalchemy import text
+
+        try:
+            with self._session() as session:
+                session.execute(
+                    text("CALL dbms_vidx.preload_check('', '', '')")
+                )
+                return True
+        except Exception as e:
+            err_msg = str(e)
+            if "PROCEDURE_NOT_FOUND" in err_msg or "Not Found" in err_msg:
+                _logger.debug("dbms_vidx procedures not found on this instance")
+                return False
+            # Other errors mean the procedure exists but rejected the args
+            return True
 
     def _validate_distance_method(self) -> None:
         """Validate INNER_PRODUCT requires v3 support."""
@@ -1144,10 +1183,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             try:
                 return json.loads(raw)
             except (json.JSONDecodeError, TypeError):
-                _logger.warning(
+                # W12: Use DEBUG to avoid leaking sensitive metadata
+                _logger.debug(
                     "Corrupted metadata JSON in database row, "
-                    "using empty dict. Raw: %s",
-                    raw[:200],
+                    "using empty dict. Raw length: %d",
+                    len(raw),
                 )
                 return {}
         return {}
@@ -1251,9 +1291,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     best_score = mmr_score
                     best_idx = idx
 
-            if best_idx != -1:
-                selected.append(best_idx)
-                candidates.remove(best_idx)
+            # W3: Guard against NaN/Inf in embeddings causing infinite
+            # loop — if no candidate scored above -inf, break.
+            if best_idx == -1:
+                break
+            selected.append(best_idx)
+            candidates.remove(best_idx)
 
         return selected
 
@@ -1305,8 +1348,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                             except (json.JSONDecodeError, ValueError):
                                 pass
             except Exception as e:
-                # I15: Use WARNING instead of DEBUG to surface failures
-                _logger.warning("Failed to fetch embeddings: %s", e)
+                # W5: Sanitize credential info from error before logging
+                _logger.warning(
+                    "Failed to fetch embeddings: %s",
+                    self._sanitize_error(e),
+                )
         return result
 
     async def _afetch_embeddings_by_node_ids(
@@ -1348,8 +1394,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                             except (json.JSONDecodeError, ValueError):
                                 pass
             except Exception as e:
-                # I15: Use WARNING instead of DEBUG to surface failures
-                _logger.warning("Failed to fetch embeddings: %s", e)
+                # W5: Sanitize credential info from error before logging
+                _logger.warning(
+                    "Failed to fetch embeddings: %s",
+                    self._sanitize_error(e),
+                )
         return result
 
     # ------------------------------------------------------------------
@@ -1504,20 +1553,43 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     ids.append(node.node_id)
                     item = self._node_to_table_row(node)
 
-                    stmt = sqlalchemy.text(f"""
-                    INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
-                    VALUES (
-                        UUID(),
-                        :node_id,
-                        :text,
-                        VEC_FROMTEXT(:embedding),
-                        :metadata
-                    )
-                    ON DUPLICATE KEY UPDATE
-                        text = VALUES(text),
-                        embedding = VALUES(embedding),
-                        metadata = VALUES(metadata)
-                    """)
+                    if self._has_partition:
+                        # W2: Partitioned tables downgrade node_id unique
+                        # index to regular INDEX, so ON DUPLICATE KEY
+                        # UPDATE cannot detect duplicates. Use
+                        # DELETE-then-INSERT to preserve upsert semantics.
+                        del_stmt = sqlalchemy.text(
+                            f"DELETE FROM `{self.table_name}` "
+                            f"WHERE node_id = :node_id"
+                        )
+                        session.execute(
+                            del_stmt, {"node_id": item["node_id"]}
+                        )
+                        stmt = sqlalchemy.text(f"""
+                        INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
+                        VALUES (
+                            UUID(),
+                            :node_id,
+                            :text,
+                            VEC_FROMTEXT(:embedding),
+                            :metadata
+                        )
+                        """)
+                    else:
+                        stmt = sqlalchemy.text(f"""
+                        INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
+                        VALUES (
+                            UUID(),
+                            :node_id,
+                            :text,
+                            VEC_FROMTEXT(:embedding),
+                            :metadata
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            text = VALUES(text),
+                            embedding = VALUES(embedding),
+                            metadata = VALUES(metadata)
+                        """)
                     session.execute(
                         stmt,
                         {
@@ -1563,20 +1635,40 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     ids.append(node.node_id)
                     item = self._node_to_table_row(node)
 
-                    stmt = sqlalchemy.text(f"""
-                    INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
-                    VALUES (
-                        UUID(),
-                        :node_id,
-                        :text,
-                        VEC_FROMTEXT(:embedding),
-                        :metadata
-                    )
-                    ON DUPLICATE KEY UPDATE
-                        text = VALUES(text),
-                        embedding = VALUES(embedding),
-                        metadata = VALUES(metadata)
-                    """)
+                    if self._has_partition:
+                        # W2: DELETE-then-INSERT for partitioned tables
+                        del_stmt = sqlalchemy.text(
+                            f"DELETE FROM `{self.table_name}` "
+                            f"WHERE node_id = :node_id"
+                        )
+                        await session.execute(
+                            del_stmt, {"node_id": item["node_id"]}
+                        )
+                        stmt = sqlalchemy.text(f"""
+                        INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
+                        VALUES (
+                            UUID(),
+                            :node_id,
+                            :text,
+                            VEC_FROMTEXT(:embedding),
+                            :metadata
+                        )
+                        """)
+                    else:
+                        stmt = sqlalchemy.text(f"""
+                        INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
+                        VALUES (
+                            UUID(),
+                            :node_id,
+                            :text,
+                            VEC_FROMTEXT(:embedding),
+                            :metadata
+                        )
+                        ON DUPLICATE KEY UPDATE
+                            text = VALUES(text),
+                            embedding = VALUES(embedding),
+                            metadata = VALUES(metadata)
+                        """)
                     await session.execute(
                         stmt,
                         {
@@ -2114,6 +2206,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """
         self._initialize()
 
+        # M5: Validate limit parameter
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError(
+                f"limit must be a positive integer, got {limit}"
+            )
+
         global_param_counter = [0]
         where_clause, filter_params = self._filters_to_where_clause(
             filters, global_param_counter
@@ -2153,6 +2251,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             List of ``BaseNode`` objects matching the metadata filter.
         """
         self._initialize()
+
+        # M5: Validate limit parameter
+        if not isinstance(limit, int) or limit <= 0:
+            raise ValueError(
+                f"limit must be a positive integer, got {limit}"
+            )
 
         global_param_counter = [0]
         where_clause, filter_params = self._filters_to_where_clause(
@@ -2608,6 +2712,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """
         self._initialize()
         self._require_v3("preload_index()")
+        if not self._capabilities.get("dbms_vidx", False):
+            raise NotSupportedError(
+                "preload_index() requires dbms_vidx stored procedures "
+                "which are not available on this instance. This may occur "
+                "on instances where VECTOR_DIM is present but dbms_vidx "
+                "procedures are not installed."
+            )
         # S2: Re-validate mutable Pydantic fields before SQL interpolation
         self._validate_identifier(self.database)
         self._validate_identifier(self.table_name)
@@ -2628,6 +2739,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Async preload the HNSW vector index (v3 only)."""
         self._initialize()
         self._require_v3("preload_index()")
+        if not self._capabilities.get("dbms_vidx", False):
+            raise NotSupportedError(
+                "apreload_index() requires dbms_vidx stored procedures "
+                "which are not available on this instance. This may occur "
+                "on instances where VECTOR_DIM is present but dbms_vidx "
+                "procedures are not installed."
+            )
         # S2: Re-validate mutable Pydantic fields before SQL interpolation
         self._validate_identifier(self.database)
         self._validate_identifier(self.table_name)
@@ -2652,6 +2770,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """
         self._initialize()
         self._require_v3("preload_check()")
+        if not self._capabilities.get("dbms_vidx", False):
+            raise NotSupportedError(
+                "preload_check() requires dbms_vidx stored procedures "
+                "which are not available on this instance. This may occur "
+                "on instances where VECTOR_DIM is present but dbms_vidx "
+                "procedures are not installed."
+            )
         # S2: Re-validate mutable Pydantic fields before SQL interpolation
         self._validate_identifier(self.database)
         self._validate_identifier(self.table_name)
@@ -2672,6 +2797,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Async check if preloading would fit in cache (v3 only)."""
         self._initialize()
         self._require_v3("preload_check()")
+        if not self._capabilities.get("dbms_vidx", False):
+            raise NotSupportedError(
+                "apreload_check() requires dbms_vidx stored procedures "
+                "which are not available on this instance. This may occur "
+                "on instances where VECTOR_DIM is present but dbms_vidx "
+                "procedures are not installed."
+            )
         # S2: Re-validate mutable Pydantic fields before SQL interpolation
         self._validate_identifier(self.database)
         self._validate_identifier(self.table_name)
@@ -2705,6 +2837,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """
         self._initialize()
         self._require_v3("explain_index_health()")
+        if not self._capabilities.get("vector_indexes_view", False):
+            raise NotSupportedError(
+                "explain_index_health() requires "
+                "information_schema.VECTOR_INDEXES which is not "
+                "available on this instance."
+            )
         result: Dict[str, Any] = {}
 
         with self._session() as session:
@@ -2769,6 +2907,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Async check vector index health (v3 only)."""
         self._initialize()
         self._require_v3("explain_index_health()")
+        if not self._capabilities.get("vector_indexes_view", False):
+            raise NotSupportedError(
+                "aexplain_index_health() requires "
+                "information_schema.VECTOR_INDEXES which is not "
+                "available on this instance."
+            )
         result: Dict[str, Any] = {}
 
         async with self._async_session() as session:

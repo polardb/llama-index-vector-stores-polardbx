@@ -196,6 +196,8 @@ def create_partitioned_table(
         columns: Column definitions as SQL strings, e.g.
             ``["id BIGINT NOT NULL AUTO_INCREMENT",
             "name VARCHAR(255)", "PRIMARY KEY (id)"]``.
+            Must be constructed by the developer — never accept
+            user-supplied input to prevent SQL injection.
         partition_by: Partition strategy: "HASH", "KEY", "RANGE", or
             "LIST". None for single table.
         partition_column: Column to partition on. Defaults to "id".
@@ -279,27 +281,30 @@ def create_partitioned_table(
     from sqlalchemy import create_engine, text
 
     engine = create_engine(uri)
-    with engine.connect() as conn:
-        try:
-            conn.execute(text(ddl))
-            conn.commit()
-        except Exception as e:
-            if partition_clause:
-                err_msg = str(e).lower()
-                if "partition" in err_msg and (
-                    "not support" in err_msg
-                    or "do not support" in err_msg
-                ):
-                    from llama_index.vector_stores.polardbx.base import (
-                        NotSupportedError,
-                    )
+    try:
+        with engine.connect() as conn:
+            try:
+                conn.execute(text(ddl))
+                conn.commit()
+            except Exception as e:
+                if partition_clause:
+                    err_msg = str(e).lower()
+                    if "partition" in err_msg and (
+                        "not support" in err_msg
+                        or "do not support" in err_msg
+                    ):
+                        from llama_index.vector_stores.polardbx.base import (
+                            NotSupportedError,
+                        )
 
-                    raise NotSupportedError(
-                        "PolarDB-X does not support partitioning on this "
-                        "instance. This may occur on certain v3 DN "
-                        "versions. Try upgrading the DN version, or "
-                        "remove partition parameters to create a "
-                        "non-partitioned table."
-                    ) from e
-            raise
-    engine.dispose()
+                        raise NotSupportedError(
+                            "PolarDB-X does not support partitioning on this "
+                            "instance. This may occur on certain v3 DN "
+                            "versions. Try upgrading the DN version, or "
+                            "remove partition parameters to create a "
+                            "non-partitioned table."
+                        ) from e
+                raise
+    finally:
+        # W1: Always dispose engine to prevent resource leak on exception
+        engine.dispose()

@@ -476,8 +476,10 @@ def test_close_without_init():
 
 
 def test_class_attributes():
-    """Class-level attributes have correct values."""
+    """Model field defaults have correct values."""
     from llama_index.vector_stores.polardbx import PolarDBXVectorStore
 
-    assert PolarDBXVectorStore.stores_text is True
-    assert PolarDBXVectorStore.flat_metadata is False
+    # stores_text and flat_metadata are Pydantic model fields,
+    # not ClassVar — access defaults via model_fields.
+    assert PolarDBXVectorStore.model_fields["stores_text"].default is True
+    assert PolarDBXVectorStore.model_fields["flat_metadata"].default is False

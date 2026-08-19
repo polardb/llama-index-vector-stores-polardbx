@@ -34,8 +34,11 @@ def _validate_identifier(name: str, label: str = "identifier") -> None:
 
 
 def _sql_quote_string(value: str) -> str:
-    """Quote a string literal using SQL-standard single-quote doubling."""
-    return "'" + value.replace("'", "''") + "'"
+    """Quote a string literal using SQL-standard single-quote doubling.
+
+    Also escapes backslashes to prevent MySQL escape interpretation.
+    """
+    return "'" + value.replace("\\", "\\\\").replace("'", "''") + "'"
 
 
 def _build_partition_clause(
@@ -57,6 +60,8 @@ def _build_partition_clause(
         parts.append("BROADCAST")
     elif partition_by:
         pby = partition_by.upper()
+        # M4: Validate partition_column as identifier (defense in depth)
+        _validate_identifier(partition_column, "partition column")
         if pby in ("HASH", "KEY"):
             parts.append(
                 f"PARTITION BY {pby}({partition_column}) PARTITIONS {partitions}"
@@ -67,6 +72,8 @@ def _build_partition_clause(
                 name = d.get("name")
                 if not name:
                     raise ValueError("Each RANGE partition def must have a 'name' key.")
+                # S1: Validate partition name as identifier
+                _validate_identifier(name, "partition name")
                 vlt = d.get("values_less_than")
                 if vlt is None:
                     raise ValueError(
@@ -89,10 +96,17 @@ def _build_partition_clause(
                 name = d.get("name")
                 if not name:
                     raise ValueError("Each LIST partition def must have a 'name' key.")
+                # S1: Validate partition name as identifier
+                _validate_identifier(name, "partition name")
                 vals = d.get("values_in")
                 if vals is None:
                     raise ValueError(
                         f"LIST partition '{name}' is missing 'values_in' key."
+                    )
+                # M1: Reject empty values_in list to prevent invalid SQL
+                if not vals:
+                    raise ValueError(
+                        f"LIST partition '{name}' has empty 'values_in' list."
                     )
                 val_str = ", ".join(
                     _sql_quote_string(v) if isinstance(v, str) else str(v) for v in vals

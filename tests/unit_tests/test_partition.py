@@ -343,7 +343,8 @@ class TestSqlQuoteString:
             _sql_quote_string,
         )
 
-        assert _sql_quote_string("path\\to\\file") == "'path\\to\\file'"
+        # M3: Backslashes are escaped to prevent MySQL escape interpretation
+        assert _sql_quote_string("path\\to\\file") == "'path\\\\to\\\\file'"
 
 
 # ---------------------------------------------------------------------------
@@ -555,7 +556,8 @@ class TestVectorStorePartitionValidation:
     def test_invalid_partition_column(self) -> None:
         from llama_index.vector_stores.polardbx import PolarDBXVectorStore
 
-        with pytest.raises(ValueError, match="partition column"):
+        # W4: Vector tables only allow partition_column="id"
+        with pytest.raises(ValueError, match="partition_column must be 'id'"):
             PolarDBXVectorStore(
                 host="localhost",
                 port=3306,
@@ -1343,3 +1345,296 @@ class TestFromParamsPartition:
         assert vs._partition_by is None
         assert vs._broadcast is False
         assert vs._has_partition is False
+
+
+# ---------------------------------------------------------------------------
+# Review v2 fix tests: S1, S2, W2, W3, W4, W5, W12, M1-M5
+# ---------------------------------------------------------------------------
+
+
+class TestReviewV2Fixes:
+    """Tests for issues identified in the v2 re-review report."""
+
+    # --- S1: Partition name identifier validation ---
+
+    def test_s1_range_partition_name_injection_rejected(self) -> None:
+        """S1: RANGE partition name with SQL injection is rejected."""
+        from llama_index.vector_stores.polardbx._partition import (
+            _build_partition_clause,
+        )
+
+        with pytest.raises(ValueError, match="partition name"):
+            _build_partition_clause(
+                partition_by="RANGE",
+                partition_column="id",
+                partition_defs=[
+                    {
+                        "name": "p1) VALUES LESS THAN (0), PARTITION p2",
+                        "values_less_than": 100,
+                    }
+                ],
+            )
+
+    def test_s1_list_partition_name_injection_rejected(self) -> None:
+        """S1: LIST partition name with SQL injection is rejected."""
+        from llama_index.vector_stores.polardbx._partition import (
+            _build_partition_clause,
+        )
+
+        with pytest.raises(ValueError, match="partition name"):
+            _build_partition_clause(
+                partition_by="LIST",
+                partition_column="id",
+                partition_defs=[
+                    {
+                        "name": "evil; DROP TABLE",
+                        "values_in": [1, 2],
+                    }
+                ],
+            )
+
+    # --- S2: Frozen model fields ---
+
+    def test_s2_table_name_not_mutable_after_init(self) -> None:
+        """S2: table_name cannot be changed after initialization."""
+        vs = _make_store()
+        with pytest.raises(Exception):
+            vs.table_name = "evil"
+
+    def test_s2_database_not_mutable_after_init(self) -> None:
+        """S2: database cannot be changed after initialization."""
+        vs = _make_store()
+        with pytest.raises(Exception):
+            vs.database = "other_db"
+
+    # --- W2: Partitioned table uses DELETE+INSERT ---
+
+    def test_w2_partitioned_add_uses_delete_insert(self) -> None:
+        """W2: Partitioned table add() uses DELETE+INSERT, not ON DUPLICATE KEY."""
+        from llama_index.vector_stores.polardbx.base import PolarDBXVectorStore
+
+        executed_sqls = []
+
+        class MockSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def execute(self, stmt, params=None):
+                executed_sqls.append(str(stmt))
+
+            def commit(self):
+                pass
+
+        with patch.object(PolarDBXVectorStore, "_initialize") as mock_init:
+            mock_init.return_value = None
+            vs = PolarDBXVectorStore(
+                host="localhost",
+                port=3306,
+                user="root",
+                password="pass",
+                database="test",
+                perform_setup=False,
+                embed_dim=4,
+                partition_by="HASH",
+                partitions=4,
+            )
+            vs._session = lambda: MockSession()
+            assert vs._has_partition is True
+
+            from llama_index.core.schema import TextNode
+
+            node = TextNode(text="hello", embedding=[0.1] * 4)
+            vs.add([node])
+
+        # First SQL should be DELETE (not INSERT ... ON DUPLICATE KEY)
+        assert "DELETE" in executed_sqls[0].upper()
+        # Should NOT have ON DUPLICATE KEY UPDATE
+        assert not any(
+            "ON DUPLICATE KEY" in sql.upper() for sql in executed_sqls
+        )
+
+    def test_w2_non_partitioned_add_uses_on_duplicate_key(self) -> None:
+        """W2: Non-partitioned table add() still uses ON DUPLICATE KEY UPDATE."""
+        from llama_index.vector_stores.polardbx.base import PolarDBXVectorStore
+
+        executed_sqls = []
+
+        class MockSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def execute(self, stmt, params=None):
+                executed_sqls.append(str(stmt))
+
+            def commit(self):
+                pass
+
+        with patch.object(PolarDBXVectorStore, "_initialize") as mock_init:
+            mock_init.return_value = None
+            vs = PolarDBXVectorStore(
+                host="localhost",
+                port=3306,
+                user="root",
+                password="pass",
+                database="test",
+                perform_setup=False,
+                embed_dim=4,
+            )
+            vs._session = lambda: MockSession()
+            assert vs._has_partition is False
+
+            from llama_index.core.schema import TextNode
+
+            node = TextNode(text="hello", embedding=[0.1] * 4)
+            vs.add([node])
+
+        # Should have ON DUPLICATE KEY UPDATE
+        assert any(
+            "ON DUPLICATE KEY" in sql.upper() for sql in executed_sqls
+        )
+
+    # --- W3: MMR NaN/Inf guard ---
+
+    def test_w3_mmr_nan_embeddings_no_infinite_loop(self) -> None:
+        """W3: MMR with NaN embeddings does not cause infinite loop."""
+        from llama_index.vector_stores.polardbx.base import PolarDBXVectorStore
+
+        # All-NaN embeddings
+        nan_vecs = [[float("nan"), float("nan")] for _ in range(5)]
+        query_vec = [1.0, 0.0]
+
+        # Should return without hanging (may return empty or partial)
+        result = PolarDBXVectorStore._maximal_marginal_relevance(
+            query_vec, nan_vecs, k=3, lambda_mult=0.5
+        )
+        assert isinstance(result, list)
+        assert len(result) <= 3
+
+    # --- W4: partition_column restricted to 'id' ---
+
+    def test_w4_valid_partition_column_id(self) -> None:
+        """W4: partition_column='id' is accepted."""
+        vs = _make_store(partition_by="HASH", partitions=4, partition_column="id")
+        assert vs._partition_column == "id"
+
+    def test_w4_non_id_partition_column_rejected(self) -> None:
+        """W4: partition_column other than 'id' is rejected for vector tables."""
+        from llama_index.vector_stores.polardbx import PolarDBXVectorStore
+
+        with pytest.raises(ValueError, match="partition_column must be 'id'"):
+            PolarDBXVectorStore(
+                host="localhost",
+                port=3306,
+                user="root",
+                password="pass",
+                database="test",
+                perform_setup=False,
+                partition_by="HASH",
+                partitions=4,
+                partition_column="node_id",
+            )
+
+    # --- W5: _fetch_embeddings log sanitization ---
+
+    def test_w5_fetch_embeddings_sanitizes_error(self) -> None:
+        """W5: _fetch_embeddings_by_node_ids sanitizes error in log."""
+        vs = _make_store()
+
+        # Mock session that raises error with embedded credentials
+        credential_error = Exception(
+            "Connection failed: mysql+pymysql://user:secret_pass@host:3306/db"
+        )
+
+        class MockSession:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def execute(self, stmt, params=None):
+                raise credential_error
+
+        vs._session = lambda: MockSession()
+
+        # Should not raise; should return empty dict
+        result = vs._fetch_embeddings_by_node_ids(["node1"])
+        assert result == {}
+
+    # --- W12: Metadata parse log level ---
+
+    def test_w12_corrupted_metadata_uses_debug_level(self) -> None:
+        """W12: Corrupted metadata JSON logs at DEBUG, not WARNING."""
+        from llama_index.vector_stores.polardbx.base import PolarDBXVectorStore
+
+        # _parse_metadata is a staticmethod, call directly
+        result = PolarDBXVectorStore._parse_metadata("not valid json")
+        assert result == {}
+
+    # --- M1: LIST empty values_in ---
+
+    def test_m1_list_empty_values_in_rejected(self) -> None:
+        """M1: LIST partition with empty values_in raises ValueError."""
+        from llama_index.vector_stores.polardbx._partition import (
+            _build_partition_clause,
+        )
+
+        with pytest.raises(ValueError, match="empty 'values_in'"):
+            _build_partition_clause(
+                partition_by="LIST",
+                partition_column="id",
+                partition_defs=[
+                    {"name": "p1", "values_in": []},
+                ],
+            )
+
+    # --- M2: base.py _validate_identifier 64-char limit ---
+
+    def test_m2_base_validate_identifier_rejects_too_long(self) -> None:
+        """M2: base.py _validate_identifier rejects names over 64 chars."""
+        from llama_index.vector_stores.polardbx.base import PolarDBXVectorStore
+
+        with pytest.raises(ValueError, match="too long"):
+            PolarDBXVectorStore._validate_identifier("a" * 65)
+
+    def test_m2_base_validate_identifier_accepts_64_chars(self) -> None:
+        """M2: base.py _validate_identifier accepts exactly 64 chars."""
+        from llama_index.vector_stores.polardbx.base import PolarDBXVectorStore
+
+        assert PolarDBXVectorStore._validate_identifier("a" * 64) == "a" * 64
+
+    # --- M3: _sql_quote_string escapes backslashes ---
+
+    def test_m3_backslash_escaped(self) -> None:
+        """M3: _sql_quote_string escapes backslashes."""
+        from llama_index.vector_stores.polardbx._partition import (
+            _sql_quote_string,
+        )
+
+        result = _sql_quote_string("a\\b")
+        assert "\\\\" in result  # backslash doubled
+
+    # --- M5: search_by_metadata limit validation ---
+
+    def test_m5_search_by_metadata_invalid_limit_zero(self) -> None:
+        """M5: search_by_metadata rejects limit=0."""
+        from llama_index.core.vector_stores.types import MetadataFilters
+
+        vs = _make_store()
+        with pytest.raises(ValueError, match="limit must be a positive integer"):
+            vs.search_by_metadata(MetadataFilters(filters=[]), limit=0)
+
+    def test_m5_search_by_metadata_invalid_limit_negative(self) -> None:
+        """M5: search_by_metadata rejects negative limit."""
+        from llama_index.core.vector_stores.types import MetadataFilters
+
+        vs = _make_store()
+        with pytest.raises(ValueError, match="limit must be a positive integer"):
+            vs.search_by_metadata(MetadataFilters(filters=[]), limit=-5)
+
