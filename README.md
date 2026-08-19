@@ -363,6 +363,52 @@ This integration uses PolarDB-X's native vector functions:
 - `CALL dbms_vidx.preload_check(db, table, col)` — Check preload feasibility (v3)
 - `information_schema.VECTOR_INDEXES` — Vector index metadata view (v3)
 
+## SQL Database
+
+`PolarDBXSQLDatabase` wraps LlamaIndex's `SQLDatabase` with PolarDB-X-specific DDL reflection fixes, enabling seamless use with LlamaIndex SQL query engines (e.g. `NLSQLTableQueryEngine`). It automatically:
+
+- Normalizes tab indentation in `SHOW CREATE TABLE` output (PolarDB-X uses tabs, standard MySQL uses two spaces)
+- Fixes ENUM/SET value list spacing (`enum('A', 'B')` to `enum('A','B')`)
+- Registers a custom `VECTOR` type so tables with vector columns do not crash reflection
+- Auto-swaps `mysql+pymysql://` URIs to use the PolarDB-X dialect
+
+```python
+from llama_index.vector_stores.polardbx import PolarDBXSQLDatabase
+
+db = PolarDBXSQLDatabase.from_uri(
+    "mysql+pymysql://user:password@host:3306/your-database"
+)
+
+# List tables
+tables = db.get_usable_table_names()
+
+# Get table schema info for SQL query engines
+info = db.get_single_table_info("your_table")
+
+# Run SQL queries
+result = db.run_sql("SELECT COUNT(*) FROM your_table")
+```
+
+### Usage with NLSQLTableQueryEngine
+
+```python
+from llama_index.core import Settings
+from llama_index.core.indices.struct_store import NLSQLTableQueryEngine
+from llama_index.vector_stores.polardbx import PolarDBXSQLDatabase
+
+db = PolarDBXSQLDatabase.from_uri(
+    "mysql+pymysql://user:password@host:3306/your-database"
+)
+
+query_engine = NLSQLTableQueryEngine(
+    sql_database=db,
+    tables=["orders", "customers"],
+)
+
+response = query_engine.query("How many orders were placed last month?")
+print(response)
+```
+
 ## Error Handling
 
 When using features that require PolarDB-X v3 (e.g. `INNER_PRODUCT` distance, `preload_index`, `explain_index_health`), a `NotSupportedError` is raised on older versions:

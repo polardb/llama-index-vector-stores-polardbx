@@ -54,6 +54,9 @@ dependencies = [
     "numpy>=1.24.0",
 ]
 
+[project.entry-points."sqlalchemy.dialects"]
+polardbx = "llama_index.vector_stores.polardbx.sql:PolarDBXDialect"
+
 [project.urls]
 Homepage = "https://github.com/polardb/llama-index-vector-stores-polardbx"
 Repository = "https://github.com/polardb/llama-index-vector-stores-polardbx"

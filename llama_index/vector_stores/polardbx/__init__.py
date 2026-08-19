@@ -1,6 +1,11 @@
 from llama_index.vector_stores.polardbx.base import (
-    PolarDBXVectorStore,
     NotSupportedError,
+    PolarDBXVectorStore,
 )
+from llama_index.vector_stores.polardbx.sql import PolarDBXSQLDatabase
 
-__all__ = ["PolarDBXVectorStore", "NotSupportedError"]
+__all__ = [
+    "NotSupportedError",
+    "PolarDBXSQLDatabase",
+    "PolarDBXVectorStore",
+]
