@@ -49,8 +49,9 @@ classifiers = [
 dependencies = [
     "llama-index-core>=0.13.0,<0.15",
     "sqlalchemy>=2.0.0,<3.0.0",
-    "aiomysql>=0.2.0",
-    "pymysql>=1.0.0",
+    "aiomysql>=0.2.0,<0.3.0",
+    "pymysql>=1.0.0,<2.0.0",
+    "numpy>=1.24.0",
 ]
 
 [project.urls]
@@ -100,7 +101,7 @@ select = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-filterwarnings = ["ignore::DeprecationWarning:"]
+filterwarnings = ["ignore::DeprecationWarning:llama_index.core.*"]
 markers = [
     "noautousefixtures: marks tests that should not run fixtures with autouse",
 ]

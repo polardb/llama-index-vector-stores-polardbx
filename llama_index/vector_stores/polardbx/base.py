@@ -12,13 +12,14 @@ The store probes capabilities at init time and caches the results, then
 branches at runtime based on the detected feature set.
 """
 
+import difflib
 import json
 import logging
 import re
 import threading
+import time
 from typing import (
     Any,
-    ClassVar,
     Dict,
     List,
     Literal,
@@ -65,6 +66,50 @@ class DBEmbeddingRow(NamedTuple):
     similarity: float
 
 
+# PolarDBXVectorStore __init__ parameters (for typo detection in **kwargs)
+_OWN_PARAMS: set = {
+    "host",
+    "port",
+    "user",
+    "password",
+    "database",
+    "table_name",
+    "embed_dim",
+    "default_m",
+    "distance_method",
+    "perform_setup",
+    "debug",
+    "ef_construction",
+    "vector_index_name",
+    "ssl",
+    "ssl_ca",
+    "connection_retries",
+    "retry_delay",
+}
+
+# pymysql / SQLAlchemy connect_args that users may pass via **kwargs
+_KNOWN_KWARGS: set = {
+    # SSL/TLS (pymysql individual params, excluding ssl_ca which
+    # is a named __init__ parameter and never reaches **kwargs)
+    "ssl_cert",
+    "ssl_key",
+    "ssl_verify_ca",
+    "ssl_verify_identity",
+    "ssl_disabled",
+    # Connection behavior
+    "connect_timeout",
+    "read_timeout",
+    "write_timeout",
+    "charset",
+    "collation",
+    "autocommit",
+    "client_flag",
+    "compress",
+    # Unix socket
+    "unix_socket",
+}
+
+
 class PolarDBXVectorStore(BasePydanticVectorStore):
     """PolarDB-X Vector Store.
 
@@ -92,8 +137,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
     """
 
-    stores_text: ClassVar[bool] = True
-    flat_metadata: ClassVar[bool] = False
+    stores_text: bool = True
+    flat_metadata: bool = False
 
     connection_string: SecretStr
     table_name: str = "llama_index_table"
@@ -115,6 +160,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     _ef_construction: Optional[int] = PrivateAttr(default=None)
     _ssl: bool = PrivateAttr(default=False)
     _ssl_ca: Optional[str] = PrivateAttr(default=None)
+    _conn_kwargs: Dict[str, Any] = PrivateAttr(default_factory=dict)
+    _connection_retries: int = PrivateAttr(default=3)
+    _retry_delay: float = PrivateAttr(default=1.0)
     _lock: Any = PrivateAttr(default_factory=threading.Lock)
 
     # ------------------------------------------------------------------
@@ -168,6 +216,31 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     # Constructor & factory
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _validate_kwargs(kwargs: Dict[str, Any]) -> None:
+        """Validate **kwargs to catch common typos and invalid arguments.
+
+        Checks each key against known PolarDBXVectorStore parameters and
+        common pymysql/SQLAlchemy connection options.  If a key looks like
+        a typo of a known parameter, raises ``TypeError`` with a suggestion.
+        """
+        for key in kwargs:
+            if key.startswith("ssl_") or key in _KNOWN_KWARGS:
+                continue
+            matches = difflib.get_close_matches(key, _OWN_PARAMS, n=3, cutoff=0.6)
+            if matches:
+                raise TypeError(
+                    f"PolarDBXVectorStore got an unexpected keyword "
+                    f"argument '{key}'. Did you mean '{matches[0]}'?"
+                )
+            raise TypeError(
+                f"PolarDBXVectorStore got an unexpected keyword "
+                f"argument '{key}'. This is not a recognized "
+                f"PolarDBXVectorStore parameter or pymysql connection "
+                f"option. Valid parameters: see PolarDBXVectorStore "
+                f"__init__ docstring."
+            )
+
     def __init__(
         self,
         host: str,
@@ -185,6 +258,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         vector_index_name: Optional[str] = None,
         ssl: bool = False,
         ssl_ca: Optional[str] = None,
+        connection_retries: int = 3,
+        retry_delay: float = 1.0,
+        **kwargs: Any,
     ) -> None:
         """Initialize the PolarDB-X vector store.
 
@@ -212,11 +288,36 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             ssl: Enable TLS/SSL encryption. Defaults to False.
             ssl_ca: Path to CA certificate for SSL verification.
                 Only effective when ``ssl=True``. Defaults to None.
+            connection_retries: Number of connection retry attempts
+                during initialization. Defaults to 3.
+            retry_delay: Delay between retry attempts in seconds.
+                Defaults to 1.0.
         """
+        self._validate_kwargs(kwargs)
+
         self._validate_identifier(table_name)
         self._validate_identifier(database)
         self._validate_positive_int(embed_dim, "embed_dim")
         self._validate_positive_int(default_m, "default_m")
+
+        # S1: Validate ef_construction range to prevent SQL injection via DDL
+        if ef_construction is not None:
+            self._validate_positive_int(ef_construction, "ef_construction")
+            if not (5 <= ef_construction <= 1000):
+                raise ValueError(
+                    f"ef_construction must be 5-1000, got {ef_construction}"
+                )
+
+        # S4: Validate connection_retries to prevent TypeError on raise None
+        if not isinstance(connection_retries, int) or connection_retries < 1:
+            raise ValueError(
+                f"connection_retries must be a positive integer, "
+                f"got {connection_retries}"
+            )
+        if not isinstance(retry_delay, (int, float)) or retry_delay < 0:
+            raise ValueError(
+                f"retry_delay must be a non-negative number, got {retry_delay}"
+            )
 
         if distance_method not in ("EUCLIDEAN", "COSINE", "INNER_PRODUCT"):
             raise ValueError(
@@ -254,6 +355,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         self._ef_construction = ef_construction
         self._ssl = ssl
         self._ssl_ca = ssl_ca
+        self._conn_kwargs = kwargs
+        self._connection_retries = connection_retries
+        self._retry_delay = retry_delay
         self._lock = threading.Lock()
 
         self._initialize()
@@ -280,6 +384,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         vector_index_name: Optional[str] = None,
         ssl: bool = False,
         ssl_ca: Optional[str] = None,
+        connection_retries: int = 3,
+        retry_delay: float = 1.0,
+        **kwargs: Any,
     ) -> "PolarDBXVectorStore":
         """Construct from parameters (factory method)."""
         return cls(
@@ -298,6 +405,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             vector_index_name=vector_index_name,
             ssl=ssl,
             ssl_ca=ssl_ca,
+            connection_retries=connection_retries,
+            retry_delay=retry_delay,
+            **kwargs,
         )
 
     # ------------------------------------------------------------------
@@ -326,11 +436,22 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 "Do NOT use in production."
             )
 
+        # I6: Warn when SSL is disabled for production awareness
+        if not self._ssl:
+            _logger.warning(
+                "SSL is disabled — database credentials will be "
+                "transmitted in plaintext. Set ssl=True for production "
+                "deployments."
+            )
+
         connect_args: Dict[str, Any] = {}
         if self._ssl:
             connect_args["ssl"] = (
                 {"ca": self._ssl_ca} if self._ssl_ca else True
             )
+        # Merge extra connection kwargs (e.g. ssl_cert, ssl_key,
+        # connect_timeout, read_timeout, etc.)
+        connect_args.update(self._conn_kwargs)
 
         conn_str = self.connection_string.get_secret_value()
         self._engine = create_engine(
@@ -367,19 +488,96 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         Uses double-checked locking to ensure thread safety during
         initialization.  Capability detection always runs (independent
         of ``perform_setup``); only table creation is gated.
+
+        If the database is temporarily unreachable, retries up to
+        ``connection_retries`` times with ``retry_delay`` seconds
+        between attempts.  Non-transient errors (``ValueError``,
+        ``NotSupportedError``) are raised immediately without retry.
         """
         if not self._is_initialized:
             with self._lock:
                 if not self._is_initialized:
-                    self._connect()
-                    # Capability detection is independent of table
-                    # creation — always probe so v3 features work
-                    # even when perform_setup=False.
-                    self._detect_capabilities()
-                    self._validate_distance_method()
-                    if self.perform_setup:
-                        self._create_table_if_not_exists()
-                    self._is_initialized = True
+                    last_exc: Optional[Exception] = None
+                    for attempt in range(self._connection_retries):
+                        try:
+                            self._connect()
+                            # Capability detection is independent of
+                            # table creation — always probe so v3
+                            # features work even when
+                            # perform_setup=False.
+                            self._detect_capabilities()
+                            self._validate_distance_method()
+                            if self.perform_setup:
+                                self._create_table_if_not_exists()
+                            self._is_initialized = True
+                            return
+                        except (ValueError, NotSupportedError):
+                            # Configuration errors — retrying won't help.
+                            raise
+                        except Exception as e:
+                            last_exc = e
+                            # Clean up partially created engines.
+                            self._cleanup_engines()
+                            if attempt < self._connection_retries - 1:
+                                _logger.warning(
+                                    "Initialization attempt %d/%d "
+                                    "failed: %s. Retrying in %.1fs...",
+                                    attempt + 1,
+                                    self._connection_retries,
+                                    self._sanitize_error(e),
+                                    self._retry_delay,
+                                )
+                                time.sleep(self._retry_delay)
+                            else:
+                                _logger.error(
+                                    "All %d initialization attempts "
+                                    "failed. Last error: %s",
+                                    self._connection_retries,
+                                    self._sanitize_error(e),
+                                )
+                    # S4: Guard against last_exc being None
+                    if last_exc is not None:
+                        raise last_exc
+                    raise RuntimeError(
+                        "Initialization failed with no exception "
+                        "captured"
+                    )
+
+    def _cleanup_engines(self) -> None:
+        """Dispose engines and reset session factories.
+
+        Called between retry attempts to avoid stale connection pools.
+        """
+        if self._engine is not None:
+            try:
+                self._engine.dispose()
+            except Exception:
+                pass
+            self._engine = None
+        if self._async_engine is not None:
+            try:
+                import asyncio
+
+                try:
+                    asyncio.get_running_loop()
+                    import concurrent.futures
+
+                    with concurrent.futures.ThreadPoolExecutor() as ex:
+                        future = ex.submit(
+                            asyncio.run,
+                            self._async_engine.dispose(),
+                        )
+                        future.result()
+                except RuntimeError:
+                    try:
+                        asyncio.run(self._async_engine.dispose())
+                    except RuntimeError:
+                        pass
+            except Exception:
+                pass
+            self._async_engine = None
+        self._session = None
+        self._async_session = None
 
     # ------------------------------------------------------------------
     # Capability detection (v3 dual-version support)
@@ -601,6 +799,60 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             ),
         }
 
+    def _validate_embedding_dimensions(
+        self, nodes: Sequence[BaseNode]
+    ) -> None:
+        """Validate that all node embeddings match the expected dimension.
+
+        Checks each node's embedding length against ``self.embed_dim``.
+        On v3 instances, additionally cross-checks with DN's
+        ``VECTOR_DIM`` to catch client/server dimension mismatches.
+
+        Args:
+            nodes: List of nodes whose embeddings to validate.
+
+        Raises:
+            ValueError: If any embedding has a mismatched dimension.
+        """
+        for i, node in enumerate(nodes):
+            emb = node.embedding
+            if emb is None:
+                raise ValueError(
+                    f"Node at index {i} (id={node.node_id}) has no "
+                    f"embedding. Call the embedding model first."
+                )
+            if len(emb) != self.embed_dim:
+                raise ValueError(
+                    f"Embedding at index {i} (id={node.node_id}) has "
+                    f"dimension {len(emb)}, expected {self.embed_dim}."
+                )
+
+        # Cross-check with DN's VECTOR_DIM if available (v3 only)
+        if self._capabilities.get("vec_dim", False) and nodes:
+            from sqlalchemy import text
+
+            sample_emb = json.dumps(nodes[0].embedding)
+            try:
+                with self._session() as session:
+                    result = session.execute(
+                        text(
+                            "SELECT VECTOR_DIM(VEC_FROMTEXT(:emb)) AS dim"
+                        ),
+                        {"emb": sample_emb},
+                    )
+                    row = result.fetchone()
+                    if row and row[0] != self.embed_dim:
+                        raise ValueError(
+                            f"DN VECTOR_DIM reports {row[0]}, "
+                            f"but client expected {self.embed_dim}."
+                        )
+            except ValueError:
+                raise
+            except Exception as e:
+                _logger.debug(
+                    "VECTOR_DIM cross-check failed: %s", e
+                )
+
     # ------------------------------------------------------------------
     # Metadata filter helpers
     # ------------------------------------------------------------------
@@ -650,13 +902,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 params[param_name] = filter_.value[i]
             filter_value = f"({','.join(placeholders)})"
         elif isinstance(filter_.value, (list, tuple)):
-            placeholders = []
-            for i in range(len(filter_.value)):
-                param_name = f"param_{global_param_counter[0]}"
-                global_param_counter[0] += 1
-                placeholders.append(f":{param_name}")
-                params[param_name] = filter_.value[i]
-            filter_value = f"({','.join(placeholders)})"
+            # I3: Non-IN/NIN operators with list values generate invalid SQL
+            raise ValueError(
+                f"Filter '{filter_.key}' uses operator "
+                f"{filter_.operator} with a list value. "
+                f"List values are only supported for IN and "
+                f"NIN operators."
+            )
         else:
             param_name = f"param_{global_param_counter[0]}"
             global_param_counter[0] += 1
@@ -772,6 +1024,206 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 return {}
         return {}
 
+    @staticmethod
+    def _sanitize_error(e: Exception) -> str:
+        """Sanitize exception message to remove embedded credentials.
+
+        SQLAlchemy ``OperationalError`` messages may contain the full
+        DSN (including password).  This method redacts the password
+        portion of any ``://user:password@host`` pattern.
+        """
+        msg = str(e)
+        msg = re.sub(
+            r"://([^:/]+):([^@]+)@",
+            r"://\1:***@",
+            msg,
+        )
+        return msg
+
+    # ------------------------------------------------------------------
+    # MMR (Maximal Marginal Relevance) support
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _maximal_marginal_relevance(
+        query_embedding: List[float],
+        embedding_list: List[List[float]],
+        k: int = 4,
+        lambda_mult: float = 0.5,
+    ) -> List[int]:
+        """Calculate maximal marginal relevance.
+
+        Selects ``k`` embeddings that balance similarity to the query
+        with diversity among selected results.
+
+        Args:
+            query_embedding: Query embedding vector.
+            embedding_list: List of candidate document embeddings.
+            k: Number of embeddings to select.
+            lambda_mult: Diversity factor (0 = max diversity,
+                1 = min diversity). Defaults to 0.5.
+
+        Returns:
+            List of selected indices into ``embedding_list``.
+        """
+        try:
+            import numpy as np
+        except ImportError as e:
+            raise ImportError(
+                "numpy is required for MMR search. "
+                "Please install it with `pip install numpy`."
+            ) from e
+
+        if not embedding_list:
+            return []
+
+        query_vec = np.array(query_embedding)
+        doc_vecs = np.array(embedding_list)
+
+        # I1: Guard against zero-norm vectors causing division by zero
+        query_norm = np.linalg.norm(query_vec)
+        doc_norms = np.linalg.norm(doc_vecs, axis=1)
+        if query_norm == 0 or np.any(doc_norms == 0):
+            _logger.warning(
+                "Zero-norm embedding detected in MMR; "
+                "falling back to simple top-k ordering."
+            )
+            return list(range(min(k, len(embedding_list))))
+
+        # Cosine similarity to query
+        query_doc_sim = np.dot(doc_vecs, query_vec) / (
+            doc_norms * query_norm
+        )
+
+        # Start with the most similar document
+        selected = [int(np.argmax(query_doc_sim))]
+        candidates = list(range(len(embedding_list)))
+        candidates.remove(selected[0])
+
+        while len(selected) < min(k, len(embedding_list)) and candidates:
+            best_score = -float("inf")
+            best_idx = -1
+
+            for idx in candidates:
+                max_sim_to_selected = max(
+                    np.dot(doc_vecs[idx], doc_vecs[sel_idx])
+                    / (
+                        np.linalg.norm(doc_vecs[idx])
+                        * np.linalg.norm(doc_vecs[sel_idx])
+                    )
+                    for sel_idx in selected
+                )
+
+                mmr_score = (
+                    lambda_mult * query_doc_sim[idx]
+                    - (1 - lambda_mult) * max_sim_to_selected
+                )
+
+                if mmr_score > best_score:
+                    best_score = mmr_score
+                    best_idx = idx
+
+            if best_idx != -1:
+                selected.append(best_idx)
+                candidates.remove(best_idx)
+
+        return selected
+
+    def _fetch_embeddings_by_node_ids(
+        self, node_ids: List[str]
+    ) -> Dict[str, List[float]]:
+        """Fetch stored embedding vectors by node_id.
+
+        Uses ``VEC_TOTEXT`` on v3 instances, ``CAST(embedding AS CHAR)``
+        on old versions.
+
+        Args:
+            node_ids: List of node_id values to fetch.
+
+        Returns:
+            Dict mapping node_id to its embedding vector.
+        """
+        if not node_ids:
+            return {}
+
+        emb_expr = (
+            "VEC_TOTEXT(embedding)"
+            if self._capabilities.get("vec_totext", False)
+            else "CAST(embedding AS CHAR)"
+        )
+
+        # Chunk to avoid SQL length limits
+        result: Dict[str, List[float]] = {}
+        chunk_size = 1000
+        for start in range(0, len(node_ids), chunk_size):
+            chunk = node_ids[start : start + chunk_size]
+            placeholders = ",".join(
+                [f":nid_{i}" for i in range(len(chunk))]
+            )
+            params = {f"nid_{i}": nid for i, nid in enumerate(chunk)}
+            stmt = sqlalchemy.text(
+                f"SELECT node_id, {emb_expr} AS emb_str "
+                f"FROM `{self.table_name}` "
+                f"WHERE node_id IN ({placeholders})"
+            )
+            try:
+                with self._session() as session:
+                    rows = session.execute(stmt, params).fetchall()
+                    for row in rows:
+                        emb_str = row[1]
+                        if isinstance(emb_str, str) and emb_str:
+                            try:
+                                result[row[0]] = json.loads(emb_str)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+            except Exception as e:
+                # I15: Use WARNING instead of DEBUG to surface failures
+                _logger.warning("Failed to fetch embeddings: %s", e)
+        return result
+
+    async def _afetch_embeddings_by_node_ids(
+        self, node_ids: List[str]
+    ) -> Dict[str, List[float]]:
+        """Async fetch stored embedding vectors by node_id."""
+        if not node_ids:
+            return {}
+
+        emb_expr = (
+            "VEC_TOTEXT(embedding)"
+            if self._capabilities.get("vec_totext", False)
+            else "CAST(embedding AS CHAR)"
+        )
+
+        result: Dict[str, List[float]] = {}
+        chunk_size = 1000
+        for start in range(0, len(node_ids), chunk_size):
+            chunk = node_ids[start : start + chunk_size]
+            placeholders = ",".join(
+                [f":nid_{i}" for i in range(len(chunk))]
+            )
+            params = {f"nid_{i}": nid for i, nid in enumerate(chunk)}
+            stmt = sqlalchemy.text(
+                f"SELECT node_id, {emb_expr} AS emb_str "
+                f"FROM `{self.table_name}` "
+                f"WHERE node_id IN ({placeholders})"
+            )
+            try:
+                async with self._async_session() as session:
+                    rows = (
+                        await session.execute(stmt, params)
+                    ).fetchall()
+                    for row in rows:
+                        emb_str = row[1]
+                        if isinstance(emb_str, str) and emb_str:
+                            try:
+                                result[row[0]] = json.loads(emb_str)
+                            except (json.JSONDecodeError, ValueError):
+                                pass
+            except Exception as e:
+                # I15: Use WARNING instead of DEBUG to surface failures
+                _logger.warning("Failed to fetch embeddings: %s", e)
+        return result
+
     # ------------------------------------------------------------------
     # Index hint & ef_search helpers
     # ------------------------------------------------------------------
@@ -854,9 +1306,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     def _set_ef_search_sync(self, session: Any, ef_search: Optional[int]) -> None:
         """Set ef_search session variable (sync)."""
         if ef_search is not None:
+            # I14: Validate ef_search range (1-10000)
+            ef_val = int(ef_search)
+            if not (1 <= ef_val <= 10000):
+                raise ValueError(
+                    f"ef_search must be 1-10000, got {ef_val}"
+                )
             session.execute(
                 sqlalchemy.text(
-                    f"SET SESSION vidx_hnsw_ef_search = {int(ef_search)}"
+                    f"SET SESSION vidx_hnsw_ef_search = {ef_val}"
                 )
             )
 
@@ -865,9 +1323,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     ) -> None:
         """Set ef_search session variable (async)."""
         if ef_search is not None:
+            # I14: Validate ef_search range (1-10000)
+            ef_val = int(ef_search)
+            if not (1 <= ef_val <= 10000):
+                raise ValueError(
+                    f"ef_search must be 1-10000, got {ef_val}"
+                )
             await session.execute(
                 sqlalchemy.text(
-                    f"SET SESSION vidx_hnsw_ef_search = {int(ef_search)}"
+                    f"SET SESSION vidx_hnsw_ef_search = {ef_val}"
                 )
             )
 
@@ -896,7 +1360,14 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         if not nodes:
             return []
 
+        self._validate_embedding_dimensions(nodes)
+
         batch_size = add_kwargs.get("batch_size", 500)
+        # I13: Validate batch_size to prevent ValueError from range()
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be a positive integer, got {batch_size}"
+            )
         ids: List[str] = []
         for start in range(0, len(nodes), batch_size):
             batch = nodes[start : start + batch_size]
@@ -948,7 +1419,14 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         if not nodes:
             return []
 
+        self._validate_embedding_dimensions(nodes)
+
         batch_size = kwargs.get("batch_size", 500)
+        # I13: Validate batch_size to prevent ValueError from range()
+        if not isinstance(batch_size, int) or batch_size <= 0:
+            raise ValueError(
+                f"batch_size must be a positive integer, got {batch_size}"
+            )
         ids: List[str] = []
         for start in range(0, len(nodes), batch_size):
             batch = nodes[start : start + batch_size]
@@ -999,9 +1477,20 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 Higher = more accurate but slower.
             search_type: ``"ann"`` (force index), ``"knn"`` (force scan),
                 or ``"auto"`` (optimizer decides). Defaults to ``"auto"``.
+            fetch_k: Number of candidates to fetch before MMR re-ranking.
+                Only used when ``query.mode`` is ``MMR``. Defaults to
+                ``max(similarity_top_k * 3, 20)``.
+            lambda_mult: MMR diversity factor (0 = max diversity,
+                1 = min diversity). Only used when ``query.mode`` is ``MMR``.
+                Defaults to 0.5.
         """
-        if query.mode != VectorStoreQueryMode.DEFAULT:
-            raise NotImplementedError(f"Query mode {query.mode} not available.")
+        if query.mode not in (
+            VectorStoreQueryMode.DEFAULT,
+            VectorStoreQueryMode.MMR,
+        ):
+            raise NotImplementedError(
+                f"Query mode {query.mode} not available."
+            )
 
         if query.query_embedding is None:
             raise ValueError(
@@ -1012,6 +1501,16 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         self._initialize()
 
+        # MMR: fetch more candidates than needed
+        is_mmr = query.mode == VectorStoreQueryMode.MMR
+        if is_mmr:
+            fetch_k = kwargs.get(
+                "fetch_k",
+                max(query.similarity_top_k * 3, 20),
+            )
+        else:
+            fetch_k = query.similarity_top_k
+
         ef_search = kwargs.get("ef_search")
         search_type = kwargs.get("search_type")
 
@@ -1021,7 +1520,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         where_clause = ""
         params: Dict[str, Any] = {
             "query_embedding": json.dumps(query.query_embedding),
-            "limit": query.similarity_top_k,
+            "limit": fetch_k,
         }
 
         if query.filters:
@@ -1063,6 +1562,33 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 )
             )
 
+        # MMR re-ranking
+        if is_mmr and len(rows) > query.similarity_top_k:
+            lambda_mult = kwargs.get("lambda_mult", 0.5)
+            node_ids = [r.node_id for r in rows]
+            emb_map = self._fetch_embeddings_by_node_ids(node_ids)
+            embedding_list = [
+                emb_map.get(nid, []) for nid in node_ids
+            ]
+            # Only apply MMR if we got embeddings
+            if all(len(e) > 0 for e in embedding_list):
+                selected = self._maximal_marginal_relevance(
+                    query_embedding=query.query_embedding,
+                    embedding_list=embedding_list,
+                    k=query.similarity_top_k,
+                    lambda_mult=lambda_mult,
+                )
+                rows = [rows[i] for i in selected]
+            else:
+                # I2: Warn when MMR re-ranking is skipped
+                _logger.warning(
+                    "MMR re-ranking skipped: could not fetch "
+                    "embeddings for %d/%d candidate rows. "
+                    "Returning distance-ordered results.",
+                    sum(1 for e in embedding_list if len(e) == 0),
+                    len(embedding_list),
+                )
+
         return self._db_rows_to_query_result(rows)
 
     async def aquery(
@@ -1070,9 +1596,23 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         query: VectorStoreQuery,
         **kwargs: Any,
     ) -> VectorStoreQueryResult:
-        """Async query the vector store."""
-        if query.mode != VectorStoreQueryMode.DEFAULT:
-            raise NotImplementedError(f"Query mode {query.mode} not available.")
+        """Async query the vector store.
+
+        Keyword Args:
+            ef_search: HNSW search candidate list size.
+            search_type: ``"ann"``, ``"knn"``, or ``"auto"``.
+            fetch_k: Candidates to fetch before MMR re-ranking
+                (MMR mode only). Defaults to
+                ``max(similarity_top_k * 3, 20)``.
+            lambda_mult: MMR diversity factor. Defaults to 0.5.
+        """
+        if query.mode not in (
+            VectorStoreQueryMode.DEFAULT,
+            VectorStoreQueryMode.MMR,
+        ):
+            raise NotImplementedError(
+                f"Query mode {query.mode} not available."
+            )
 
         if query.query_embedding is None:
             raise ValueError(
@@ -1083,6 +1623,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         self._initialize()
 
+        is_mmr = query.mode == VectorStoreQueryMode.MMR
+        if is_mmr:
+            fetch_k = kwargs.get(
+                "fetch_k",
+                max(query.similarity_top_k * 3, 20),
+            )
+        else:
+            fetch_k = query.similarity_top_k
+
         ef_search = kwargs.get("ef_search")
         search_type = kwargs.get("search_type")
 
@@ -1092,7 +1641,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         where_clause = ""
         params: Dict[str, Any] = {
             "query_embedding": json.dumps(query.query_embedding),
-            "limit": query.similarity_top_k,
+            "limit": fetch_k,
         }
 
         if query.filters:
@@ -1133,6 +1682,34 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     else 0.0,
                 )
             )
+
+        # MMR re-ranking
+        if is_mmr and len(rows) > query.similarity_top_k:
+            lambda_mult = kwargs.get("lambda_mult", 0.5)
+            node_ids = [r.node_id for r in rows]
+            emb_map = await self._afetch_embeddings_by_node_ids(
+                node_ids
+            )
+            embedding_list = [
+                emb_map.get(nid, []) for nid in node_ids
+            ]
+            if all(len(e) > 0 for e in embedding_list):
+                selected = self._maximal_marginal_relevance(
+                    query_embedding=query.query_embedding,
+                    embedding_list=embedding_list,
+                    k=query.similarity_top_k,
+                    lambda_mult=lambda_mult,
+                )
+                rows = [rows[i] for i in selected]
+            else:
+                # I2: Warn when MMR re-ranking is skipped
+                _logger.warning(
+                    "MMR re-ranking skipped: could not fetch "
+                    "embeddings for %d/%d candidate rows. "
+                    "Returning distance-ordered results.",
+                    sum(1 for e in embedding_list if len(e) == 0),
+                    len(embedding_list),
+                )
 
         return self._db_rows_to_query_result(rows)
 
@@ -1385,6 +1962,151 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 await session.commit()
 
     # ------------------------------------------------------------------
+    # Metadata-only search and delete (no vector similarity)
+    # ------------------------------------------------------------------
+
+    def search_by_metadata(
+        self,
+        filters: MetadataFilters,
+        limit: int = 10,
+    ) -> List[BaseNode]:
+        """Search nodes by metadata conditions only (no vector similarity).
+
+        Performs a metadata-based query without vector similarity search.
+        Useful for filtering, browsing, or auditing stored nodes.
+
+        Args:
+            filters: LlamaIndex ``MetadataFilters`` specifying the
+                metadata conditions to match.
+            limit: Maximum number of results to return. Defaults to 10.
+
+        Returns:
+            List of ``BaseNode`` objects matching the metadata filter,
+            with content and metadata populated.
+        """
+        self._initialize()
+
+        global_param_counter = [0]
+        where_clause, filter_params = self._filters_to_where_clause(
+            filters, global_param_counter
+        )
+
+        stmt = sqlalchemy.text(
+            f"SELECT node_id, text, metadata "
+            f"FROM `{self.table_name}` "
+            f"WHERE {where_clause} LIMIT :limit"
+        )
+        filter_params["limit"] = limit
+
+        with self._session() as session:
+            result = session.execute(stmt, filter_params)
+            nodes: List[BaseNode] = []
+            for row in result:
+                meta = self._parse_metadata(row[2])
+                node = metadata_dict_to_node(meta or {})
+                node.set_content(str(row[1]))
+                node.node_id = str(row[0])
+                nodes.append(node)
+        return nodes
+
+    async def asearch_by_metadata(
+        self,
+        filters: MetadataFilters,
+        limit: int = 10,
+    ) -> List[BaseNode]:
+        """Async search nodes by metadata conditions only.
+
+        Args:
+            filters: LlamaIndex ``MetadataFilters`` specifying the
+                metadata conditions to match.
+            limit: Maximum number of results to return. Defaults to 10.
+
+        Returns:
+            List of ``BaseNode`` objects matching the metadata filter.
+        """
+        self._initialize()
+
+        global_param_counter = [0]
+        where_clause, filter_params = self._filters_to_where_clause(
+            filters, global_param_counter
+        )
+
+        stmt = sqlalchemy.text(
+            f"SELECT node_id, text, metadata "
+            f"FROM `{self.table_name}` "
+            f"WHERE {where_clause} LIMIT :limit"
+        )
+        filter_params["limit"] = limit
+
+        async with self._async_session() as session:
+            result = await session.execute(stmt, filter_params)
+            nodes: List[BaseNode] = []
+            for row in result:
+                meta = self._parse_metadata(row[2])
+                node = metadata_dict_to_node(meta or {})
+                node.set_content(str(row[1]))
+                node.node_id = str(row[0])
+                nodes.append(node)
+        return nodes
+
+    def delete_by_metadata(self, filters: MetadataFilters) -> int:
+        """Delete nodes matching metadata conditions.
+
+        Args:
+            filters: LlamaIndex ``MetadataFilters`` specifying the
+                metadata conditions to match. Required.
+
+        Returns:
+            Number of deleted rows.
+        """
+        self._initialize()
+
+        global_param_counter = [0]
+        where_clause, filter_params = self._filters_to_where_clause(
+            filters, global_param_counter
+        )
+
+        stmt = sqlalchemy.text(
+            f"DELETE FROM `{self.table_name}` "
+            f"WHERE {where_clause}"
+        )
+
+        with self._session() as session:
+            result = session.execute(stmt, filter_params)
+            session.commit()
+            return result.rowcount
+
+    async def adelete_by_metadata(
+        self,
+        filters: MetadataFilters,
+    ) -> int:
+        """Async delete nodes matching metadata conditions.
+
+        Args:
+            filters: LlamaIndex ``MetadataFilters`` specifying the
+                metadata conditions to match. Required.
+
+        Returns:
+            Number of deleted rows.
+        """
+        self._initialize()
+
+        global_param_counter = [0]
+        where_clause, filter_params = self._filters_to_where_clause(
+            filters, global_param_counter
+        )
+
+        stmt = sqlalchemy.text(
+            f"DELETE FROM `{self.table_name}` "
+            f"WHERE {where_clause}"
+        )
+
+        async with self._async_session() as session:
+            result = await session.execute(stmt, filter_params)
+            await session.commit()
+            return result.rowcount
+
+    # ------------------------------------------------------------------
     # Utility: count, clear, drop, close
     # ------------------------------------------------------------------
 
@@ -1531,7 +2253,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """
         self._initialize()
         self._validate_identifier(index_name)
+        # S1: Validate m and ef_construction to prevent SQL injection
         m_val = m or self.default_m
+        self._validate_positive_int(m_val, "m")
+        if not (3 <= m_val <= 200):
+            raise ValueError(f"m must be 3-200, got {m_val}")
         dist_val = (distance or self.distance_method).upper()
         if dist_val not in ("COSINE", "EUCLIDEAN", "INNER_PRODUCT"):
             raise ValueError(
@@ -1547,6 +2273,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 "Use 'COSINE' or 'EUCLIDEAN' for old versions."
             )
         ef_val = ef_construction or self._ef_construction
+        if ef_val is not None:
+            self._validate_positive_int(ef_val, "ef_construction")
+            if not (5 <= ef_val <= 1000):
+                raise ValueError(
+                    f"ef_construction must be 5-1000, got {ef_val}"
+                )
         ef_clause = ""
         if ef_val is not None and self._capabilities.get("vec_dim", False):
             ef_clause = f" EF_CONSTRUCTION={ef_val}"
@@ -1577,7 +2309,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Async create a vector index."""
         self._initialize()
         self._validate_identifier(index_name)
+        # S1: Validate m and ef_construction to prevent SQL injection
         m_val = m or self.default_m
+        self._validate_positive_int(m_val, "m")
+        if not (3 <= m_val <= 200):
+            raise ValueError(f"m must be 3-200, got {m_val}")
         dist_val = (distance or self.distance_method).upper()
         if dist_val not in ("COSINE", "EUCLIDEAN", "INNER_PRODUCT"):
             raise ValueError(
@@ -1593,6 +2329,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 "Use 'COSINE' or 'EUCLIDEAN' for old versions."
             )
         ef_val = ef_construction or self._ef_construction
+        if ef_val is not None:
+            self._validate_positive_int(ef_val, "ef_construction")
+            if not (5 <= ef_val <= 1000):
+                raise ValueError(
+                    f"ef_construction must be 5-1000, got {ef_val}"
+                )
         ef_clause = ""
         if ef_val is not None and self._capabilities.get("vec_dim", False):
             ef_clause = f" EF_CONSTRUCTION={ef_val}"
@@ -1738,6 +2480,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """
         self._initialize()
         self._require_v3("preload_index()")
+        # S2: Re-validate mutable Pydantic fields before SQL interpolation
+        self._validate_identifier(self.database)
+        self._validate_identifier(self.table_name)
         with self._session() as session:
             result = session.execute(
                 sqlalchemy.text(
@@ -1755,6 +2500,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Async preload the HNSW vector index (v3 only)."""
         self._initialize()
         self._require_v3("preload_index()")
+        # S2: Re-validate mutable Pydantic fields before SQL interpolation
+        self._validate_identifier(self.database)
+        self._validate_identifier(self.table_name)
         async with self._async_session() as session:
             result = await session.execute(
                 sqlalchemy.text(
@@ -1776,6 +2524,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """
         self._initialize()
         self._require_v3("preload_check()")
+        # S2: Re-validate mutable Pydantic fields before SQL interpolation
+        self._validate_identifier(self.database)
+        self._validate_identifier(self.table_name)
         with self._session() as session:
             result = session.execute(
                 sqlalchemy.text(
@@ -1793,6 +2544,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Async check if preloading would fit in cache (v3 only)."""
         self._initialize()
         self._require_v3("preload_check()")
+        # S2: Re-validate mutable Pydantic fields before SQL interpolation
+        self._validate_identifier(self.database)
+        self._validate_identifier(self.table_name)
         async with self._async_session() as session:
             result = await session.execute(
                 sqlalchemy.text(

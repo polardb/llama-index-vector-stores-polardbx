@@ -24,8 +24,11 @@ def test_class_name():
 
 def test_class_attributes():
     """Class-level attributes have expected values."""
-    assert PolarDBXVectorStore.stores_text is True
-    assert PolarDBXVectorStore.flat_metadata is False
+    # stores_text and flat_metadata are regular Pydantic fields (not ClassVar),
+    # so check defaults via model_fields instead of class-level access.
+    fields = PolarDBXVectorStore.model_fields
+    assert fields["stores_text"].default is True
+    assert fields["flat_metadata"].default is False
 
 
 def test_is_subclass_of_base():
