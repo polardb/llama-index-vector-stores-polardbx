@@ -85,6 +85,12 @@ _OWN_PARAMS: set = {
     "ssl_ca",
     "connection_retries",
     "retry_delay",
+    "partition_by",
+    "partitions",
+    "partition_column",
+    "broadcast",
+    "locality",
+    "partition_defs",
 }
 
 # pymysql / SQLAlchemy connect_args that users may pass via **kwargs
@@ -260,6 +266,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         ssl_ca: Optional[str] = None,
         connection_retries: int = 3,
         retry_delay: float = 1.0,
+        partition_by: Optional[str] = None,
+        partitions: int = 0,
+        partition_column: Optional[str] = None,
+        broadcast: bool = False,
+        locality: Optional[str] = None,
+        partition_defs: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the PolarDB-X vector store.
@@ -292,6 +304,22 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 during initialization. Defaults to 3.
             retry_delay: Delay between retry attempts in seconds.
                 Defaults to 1.0.
+            partition_by: Partition strategy for the table. One of
+                ``"HASH"``, ``"KEY"``, ``"RANGE"``, ``"LIST"``, or None.
+                If None and broadcast is False, creates a single
+                (non-partitioned) table. Defaults to None.
+            partitions: Number of partitions. Required when
+                partition_by is ``"HASH"`` or ``"KEY"``. Defaults to 0.
+            partition_column: Column to partition on. Defaults to ``"id"``.
+            broadcast: If True, creates a broadcast table (full copy on
+                every DN node). Mutually exclusive with partition_by.
+                Defaults to False.
+            locality: Storage node specification, e.g. ``"dn=xxx"``.
+                Appended to DDL as LOCALITY clause. Defaults to None.
+            partition_defs: Partition definitions for RANGE/LIST
+                strategies. Each dict has a ``"name"`` key and either
+                ``"values_less_than"`` (RANGE) or ``"values_in"`` (LIST).
+                Defaults to None.
         """
         self._validate_kwargs(kwargs)
 
@@ -324,6 +352,34 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 f"Invalid distance_method: {distance_method}. "
                 "Must be 'COSINE', 'EUCLIDEAN', or 'INNER_PRODUCT'."
             )
+
+        # Validate partition params
+        _pby = partition_by.upper() if partition_by else None
+        if _pby and _pby not in ("HASH", "KEY", "RANGE", "LIST"):
+            raise ValueError(
+                f"Invalid partition_by: {partition_by}. "
+                "Must be 'HASH', 'KEY', 'RANGE', or 'LIST'."
+            )
+        if _pby in ("HASH", "KEY") and partitions <= 0:
+            raise ValueError(
+                "partitions must be > 0 when partition_by is 'HASH' or 'KEY'."
+            )
+        if _pby in ("RANGE", "LIST") and not partition_defs:
+            raise ValueError(
+                "partition_defs must be provided when partition_by is "
+                "'RANGE' or 'LIST'."
+            )
+        if broadcast and _pby:
+            raise ValueError(
+                "broadcast and partition_by are mutually exclusive. "
+                "Use one or the other."
+            )
+        _pcolumn = partition_column or "id"
+        if _pby and _pcolumn != "id":
+            from llama_index.vector_stores.polardbx._partition import (
+                _validate_identifier as _validate_id,
+            )
+            _validate_id(_pcolumn, "partition column")
 
         password_safe = quote_plus(password)
         user_safe = quote_plus(user)
@@ -358,6 +414,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         self._conn_kwargs = kwargs
         self._connection_retries = connection_retries
         self._retry_delay = retry_delay
+        self._partition_by = _pby
+        self._partitions = partitions
+        self._partition_column = _pcolumn
+        self._broadcast = broadcast
+        self._locality = locality
+        self._partition_defs = partition_defs
         self._lock = threading.Lock()
 
         self._initialize()
@@ -386,6 +448,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         ssl_ca: Optional[str] = None,
         connection_retries: int = 3,
         retry_delay: float = 1.0,
+        partition_by: Optional[str] = None,
+        partitions: int = 0,
+        partition_column: Optional[str] = None,
+        broadcast: bool = False,
+        locality: Optional[str] = None,
+        partition_defs: Optional[List[Dict[str, Any]]] = None,
         **kwargs: Any,
     ) -> "PolarDBXVectorStore":
         """Construct from parameters (factory method)."""
@@ -407,6 +475,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             ssl_ca=ssl_ca,
             connection_retries=connection_retries,
             retry_delay=retry_delay,
+            partition_by=partition_by,
+            partitions=partitions,
+            partition_column=partition_column,
+            broadcast=broadcast,
+            locality=locality,
+            partition_defs=partition_defs,
             **kwargs,
         )
 
@@ -759,6 +833,31 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     # Table setup
     # ------------------------------------------------------------------
 
+    def _build_partition_clause(self) -> str:
+        """Build the PARTITION/BROADCAST/LOCALITY clause for CREATE TABLE.
+
+        Returns an empty string for a single (non-partitioned) table.
+        Delegates to _partition._build_partition_clause() to keep a
+        single source of truth for partition clause generation.
+        """
+        from llama_index.vector_stores.polardbx._partition import (
+            _build_partition_clause as _build,
+        )
+
+        return _build(
+            partition_by=self._partition_by,
+            partition_column=self._partition_column,
+            partitions=self._partitions,
+            broadcast=self._broadcast,
+            locality=self._locality,
+            partition_defs=self._partition_defs,
+        )
+
+    @property
+    def _has_partition(self) -> bool:
+        """Return True if the table uses partitioning or broadcast."""
+        return self._broadcast or self._partition_by is not None
+
     def _create_table_if_not_exists(self) -> None:
         """Create the vector table if it does not exist."""
         from sqlalchemy import text
@@ -771,20 +870,49 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         ):
             ef_clause = f" EF_CONSTRUCTION={self._ef_construction}"
 
-        stmt = text(f"""
+        # When partitioning is enabled, PolarDB-X requires that unique
+        # indexes include the partition key. The node_id unique index does
+        # not include the partition key (default: id), so downgrade it
+        # to a regular INDEX. The id PRIMARY KEY already guarantees row
+        # uniqueness, and LlamaIndex handles dedup at the app level.
+        node_index_type = (
+            "INDEX" if self._has_partition else "UNIQUE INDEX"
+        )
+
+        partition_clause = self._build_partition_clause()
+        # Strip trailing semicolon — partition clause goes before it
+        base_ddl = f"""
         CREATE TABLE IF NOT EXISTS `{self.table_name}` (
             id VARCHAR(36) PRIMARY KEY,
             node_id VARCHAR(255) NOT NULL,
             text LONGTEXT,
             metadata JSON,
             embedding VECTOR({self.embed_dim}) NOT NULL,
-            UNIQUE INDEX `node_id_index` (node_id),
+            {node_index_type} `node_id_index` (node_id),
             VECTOR INDEX `vi` (embedding) M={self.default_m}{ef_clause} DISTANCE={self.distance_method}
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
-        """)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """
+        stmt = text(base_ddl + partition_clause + ";")
         with self._session() as session:
-            session.execute(stmt)
-            session.commit()
+            try:
+                session.execute(stmt)
+                session.commit()
+            except Exception as e:
+                if self._has_partition:
+                    err_msg = str(e).lower()
+                    if "partition" in err_msg and (
+                        "not support" in err_msg
+                        or "do not support" in err_msg
+                    ):
+                        raise NotSupportedError(
+                            "PolarDB-X vector index on partitioned tables is "
+                            "not supported on this instance. This may occur "
+                            "on older v3 DN versions. Try upgrading the DN "
+                            "version, or remove partition parameters "
+                            "(partition_by, broadcast, etc.) to create a "
+                            "non-partitioned vector table."
+                        ) from e
+                raise
 
     def _node_to_table_row(self, node: BaseNode) -> Dict[str, Any]:
         """Convert a LlamaIndex node to a table row dict."""

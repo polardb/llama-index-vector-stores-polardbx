@@ -37,7 +37,17 @@ DB_USER = _uri.username or "root"
 DB_PASS = _uri.password or ""
 DB_NAME = _uri.path.lstrip("/") or "test"
 
+# DN node name for LOCALITY tests (instance-specific)
+DN_NODE = os.environ.get("POLARDBX_DN_NODE", "")
+
 EMBED_DIM = 128
+
+
+def uri() -> str:
+    """Build a mysql+pymysql URI from .env credentials."""
+    from urllib.parse import quote_plus
+
+    return f"mysql+pymysql://{DB_USER}:{quote_plus(DB_PASS)}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
 
 # ---- Fake embeddings ----
@@ -144,7 +154,7 @@ def make_store(
         password=DB_PASS,
         database=DB_NAME,
         table_name=table_name,
-        embed_dim=EMBED_DIM,
+        embed_dim=kwargs.pop("embed_dim", EMBED_DIM),
         default_m=kwargs.pop("default_m", 6),
         distance_method=distance_method,
         perform_setup=kwargs.pop("perform_setup", True),

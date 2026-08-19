@@ -14,7 +14,7 @@ package, no optional ``[sql]`` extra is needed.
 from __future__ import annotations
 
 import re
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy.dialects.mysql.pymysql import MySQLDialect_pymysql
 from sqlalchemy.dialects.mysql.reflection import MySQLTableDefinitionParser
@@ -163,3 +163,143 @@ class PolarDBXSQLDatabase(SQLDatabase):
             database_uri = "polardbx+pymysql://" + database_uri[len("mysql://") :]
 
         return super().from_uri(database_uri, engine_args, **kwargs)  # type: ignore[return-value]
+
+
+# ---------------------------------------------------------------------------
+# Standalone DDL helper for non-vector partitioned tables
+# ---------------------------------------------------------------------------
+
+
+def create_partitioned_table(
+    uri: str,
+    table_name: str,
+    columns: List[str],
+    partition_by: Optional[str] = None,
+    partition_column: str = "id",
+    partitions: int = 0,
+    broadcast: bool = False,
+    locality: Optional[str] = None,
+    partition_defs: Optional[List[Dict[str, Any]]] = None,
+    if_not_exists: bool = True,
+) -> None:
+    """Create a table on PolarDB-X with optional partition clauses.
+
+    This function executes raw DDL via SQLAlchemy. Since SQLAlchemy
+    and pymysql are core dependencies of this package, no extra
+    installation is needed.
+
+    Args:
+        uri: Connection URI, e.g.
+            ``"mysql+pymysql://user:pass@host:3306/db"``.
+            Will be auto-swapped to ``polardbx+pymysql://``.
+        table_name: The table name.
+        columns: Column definitions as SQL strings, e.g.
+            ``["id BIGINT NOT NULL AUTO_INCREMENT",
+            "name VARCHAR(255)", "PRIMARY KEY (id)"]``.
+        partition_by: Partition strategy: "HASH", "KEY", "RANGE", or
+            "LIST". None for single table.
+        partition_column: Column to partition on. Defaults to "id".
+        partitions: Number of partitions (HASH/KEY only).
+        broadcast: If True, create a broadcast table.
+        locality: Storage node, e.g. "dn=xxx".
+        partition_defs: Partition definitions (RANGE/LIST only).
+        if_not_exists: If True, add IF NOT EXISTS.
+
+    Example:
+        .. code-block:: python
+
+            from llama_index.vector_stores.polardbx import create_partitioned_table
+
+            create_partitioned_table(
+                uri="mysql+pymysql://user:pass@host:3306/db",
+                table_name="orders",
+                columns=[
+                    "id BIGINT NOT NULL AUTO_INCREMENT",
+                    "user_id BIGINT NOT NULL",
+                    "amount DECIMAL(10,2)",
+                    "created_at DATETIME",
+                    "PRIMARY KEY (id)",
+                ],
+                partition_by="HASH",
+                partition_column="user_id",
+                partitions=16,
+            )
+    """
+    from llama_index.vector_stores.polardbx._partition import (
+        _build_partition_clause,
+        _validate_identifier,
+    )
+
+    _register_dialect()
+
+    # Validate identifiers to prevent SQL injection
+    _validate_identifier(table_name, "table name")
+    if partition_by:
+        _validate_identifier(partition_column, "partition column")
+
+    # Auto-swap mysql:// to polardbx://
+    if uri.startswith("mysql+pymysql://"):
+        uri = "polardbx+pymysql://" + uri[len("mysql+pymysql://") :]
+    elif uri.startswith("mysql://"):
+        uri = "polardbx+pymysql://" + uri[len("mysql://") :]
+
+    # Validate params
+    if partition_by:
+        partition_by = partition_by.upper()
+        if partition_by not in ("HASH", "KEY", "RANGE", "LIST"):
+            raise ValueError(
+                f"Invalid partition_by: {partition_by}. "
+                "Must be 'HASH', 'KEY', 'RANGE', or 'LIST'."
+            )
+        if partition_by in ("HASH", "KEY") and partitions <= 0:
+            raise ValueError("partitions must be > 0 for HASH/KEY partitioning.")
+        if partition_by in ("RANGE", "LIST") and not partition_defs:
+            raise ValueError("partition_defs required for RANGE/LIST partitioning.")
+    if broadcast and partition_by:
+        raise ValueError("broadcast and partition_by are mutually exclusive.")
+
+    # Build DDL
+    exists_clause = "IF NOT EXISTS " if if_not_exists else ""
+    col_defs = ",\n    ".join(columns)
+    partition_clause = _build_partition_clause(
+        partition_by=partition_by,
+        partition_column=partition_column,
+        partitions=partitions,
+        broadcast=broadcast,
+        locality=locality,
+        partition_defs=partition_defs,
+    )
+
+    ddl = (
+        f"CREATE TABLE {exists_clause}`{table_name}` (\n"
+        f"    {col_defs}\n"
+        f"){partition_clause}"
+    )
+
+    from sqlalchemy import create_engine, text
+
+    engine = create_engine(uri)
+    with engine.connect() as conn:
+        try:
+            conn.execute(text(ddl))
+            conn.commit()
+        except Exception as e:
+            if partition_clause:
+                err_msg = str(e).lower()
+                if "partition" in err_msg and (
+                    "not support" in err_msg
+                    or "do not support" in err_msg
+                ):
+                    from llama_index.vector_stores.polardbx.base import (
+                        NotSupportedError,
+                    )
+
+                    raise NotSupportedError(
+                        "PolarDB-X does not support partitioning on this "
+                        "instance. This may occur on certain v3 DN "
+                        "versions. Try upgrading the DN version, or "
+                        "remove partition parameters to create a "
+                        "non-partitioned table."
+                    ) from e
+            raise
+    engine.dispose()

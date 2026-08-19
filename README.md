@@ -44,6 +44,7 @@ All transaction isolation levels (READ-COMMITTED, REPEATABLE-READ, SERIALIZABLE)
 - **Batch Operations**: Batch insert with UPSERT support within a single transaction
 - **Full Async Support**: All public methods have async equivalents (`async_add`, `aquery`, etc.)
 - **Dual-Version Compatibility**: Automatically detects database capabilities and adapts SQL accordingly
+- **Partitioned Table Support**: Create partitioned vector tables with HASH/KEY/RANGE/LIST strategies, broadcast tables, and LOCALITY node assignment
 - **Connection Pooling**: Built-in SQLAlchemy Engine with connection pooling
 
 ## Installation
@@ -323,6 +324,125 @@ async def main():
 asyncio.run(main())
 ```
 
+## Partitioned Tables
+
+PolarDB-X is a distributed database that supports table partitioning for scalability. This package supports creating partitioned vector tables and standalone partitioned tables.
+
+### Vector Store with Partitioning
+
+```python
+from llama_index.vector_stores.polardbx import PolarDBXVectorStore
+
+# HASH partitioning (8 partitions on the id column)
+vector_store = PolarDBXVectorStore(
+    host="your-host", port=3306, user="your-user", password="your-password",
+    database="your-database", table_name="partitioned_vectors",
+    embed_dim=1536,
+    partition_by="HASH",          # "HASH", "KEY", "RANGE", or "LIST"
+    partition_column="id",        # column to partition on (default: "id")
+    partitions=8,                 # number of partitions (HASH/KEY only)
+)
+
+# Broadcast table (full copy on every DN node)
+vector_store = PolarDBXVectorStore(
+    ..., broadcast=True,
+)
+
+# RANGE partitioning
+vector_store = PolarDBXVectorStore(
+    ..., partition_by="RANGE", partition_column="id",
+    partition_defs=[
+        {"name": "p0", "values_less_than": 1000},
+        {"name": "p1", "values_less_than": "MAXVALUE"},
+    ],
+)
+
+# With LOCALITY (pin table to a specific DN node)
+vector_store = PolarDBXVectorStore(
+    ..., locality="dn=your-dn-node-name",
+)
+```
+
+> **Note**: When partitioning is enabled, the `node_id` UNIQUE INDEX is automatically downgraded to a regular INDEX. PolarDB-X requires that unique indexes include the partition key, and since `node_id` is not the partition key, a UNIQUE constraint would be incompatible with partitioning.
+>
+> **Note**: LIST partitioning is generally not practical for VectorStore tables because the `id` column is a UUID string — LIST requires exact value enumeration, which is infeasible for UUIDs. Use HASH or KEY partitioning for VectorStore tables instead. LIST partitioning is better suited for `create_partitioned_table()` on tables with known, bounded value sets (e.g., region codes).
+
+### Standalone Partitioned Table (Non-Vector)
+
+For non-vector tables (e.g., for SQL agents), use `create_partitioned_table`:
+
+```python
+from llama_index.vector_stores.polardbx import create_partitioned_table
+
+# HASH partitioning
+create_partitioned_table(
+    uri="mysql+pymysql://user:password@host:3306/database",
+    table_name="orders",
+    columns=[
+        "id BIGINT NOT NULL AUTO_INCREMENT",
+        "user_id BIGINT NOT NULL",
+        "amount DECIMAL(10,2)",
+        "created_at DATETIME",
+        "PRIMARY KEY (id)",
+    ],
+    partition_by="HASH",
+    partition_column="user_id",
+    partitions=16,
+)
+
+# Broadcast table (dimension table, full copy on every DN)
+create_partitioned_table(
+    uri="mysql+pymysql://user:password@host:3306/database",
+    table_name="dim_currency",
+    columns=["code VARCHAR(10)", "name VARCHAR(100)", "PRIMARY KEY (code)"],
+    broadcast=True,
+)
+
+# RANGE partitioning
+create_partitioned_table(
+    uri="mysql+pymysql://user:password@host:3306/database",
+    table_name="logs",
+    columns=["id BIGINT NOT NULL", "ts DATETIME", "PRIMARY KEY (id)"],
+    partition_by="RANGE",
+    partition_column="id",
+    partition_defs=[
+        {"name": "p0", "values_less_than": 1000000},
+        {"name": "p1", "values_less_than": 2000000},
+        {"name": "p2", "values_less_than": "MAXVALUE"},
+    ],
+)
+
+# LIST partitioning
+create_partitioned_table(
+    uri="mysql+pymysql://user:password@host:3306/database",
+    table_name="customers",
+    columns=[
+        "id BIGINT NOT NULL AUTO_INCREMENT",
+        "region VARCHAR(20) NOT NULL",
+        "name VARCHAR(255)",
+        "PRIMARY KEY (id, region)",
+    ],
+    partition_by="LIST",
+    partition_column="region",
+    partition_defs=[
+        {"name": "p_east", "values_in": ["east"]},
+        {"name": "p_west", "values_in": ["west"]},
+        {"name": "p_other", "values_in": ["north", "south"]},
+    ],
+)
+```
+
+Supported partition strategies:
+
+| Strategy | Parameters | Description |
+|----------|------------|-------------|
+| `HASH` | `partition_column`, `partitions` | Hash partitioning by column value |
+| `KEY` | `partition_column`, `partitions` | Key partitioning (single column) |
+| `RANGE` | `partition_column`, `partition_defs` | Range partitioning with explicit boundaries |
+| `LIST` | `partition_column`, `partition_defs` | List partitioning with explicit value lists |
+| `BROADCAST` | (none) | Full table copy on every DN node |
+| `LOCALITY` | `locality` | Pin table to a specific storage node |
+
 ## Configuration Options
 
 | Parameter | Type | Default | Description |
@@ -342,6 +462,12 @@ asyncio.run(main())
 | `ssl` | bool | False | Enable TLS/SSL encryption |
 | `ssl_ca` | str | None | Path to CA certificate for SSL verification (only effective when `ssl=True`) |
 | `vector_index_name` | str | None | Vector index name for FORCE INDEX hints (auto-detected if None) |
+| `partition_by` | str | None | Partition strategy: `"HASH"`, `"KEY"`, `"RANGE"`, or `"LIST"` |
+| `partitions` | int | 0 | Number of partitions (required for HASH/KEY) |
+| `partition_column` | str | None | Column to partition on (defaults to `"id"` at runtime) |
+| `broadcast` | bool | False | Create a broadcast table (full copy on every DN) |
+| `locality` | str | None | Pin table to a specific DN node, e.g. `"dn=node-name"` |
+| `partition_defs` | list | None | Partition definitions for RANGE/LIST (see examples above) |
 
 ## PolarDB-X Vector Functions Used
 

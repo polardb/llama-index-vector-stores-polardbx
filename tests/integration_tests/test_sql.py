@@ -12,14 +12,16 @@ Requires a real PolarDB-X instance. Set POLARDBX_URI env var or edit the URI bel
 """
 
 import os
+import sys
 
 import pytest
 from sqlalchemy import create_engine, text
 
-URI = os.getenv(
-    "POLARDBX_URI",
-    "mysql+pymysql://polardbx_root:t48fs2hh@127.0.0.1:37306/test_v3",
-)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from _helpers import uri
+
+URI = uri()
 
 # Use a unique test table name to avoid collisions
 TEST_TABLE = "sql_it_test_tbl"
