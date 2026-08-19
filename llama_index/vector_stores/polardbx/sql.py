@@ -13,13 +13,19 @@ package, no optional ``[sql]`` extra is needed.
 
 from __future__ import annotations
 
+import logging
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
+from sqlalchemy import MetaData, text
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects.mysql.pymysql import MySQLDialect_pymysql
 from sqlalchemy.dialects.mysql.reflection import MySQLTableDefinitionParser
+from sqlalchemy.engine import Engine
 from sqlalchemy.types import UserDefinedType
 from sqlalchemy.util import memoized_property
+
+logger = logging.getLogger(__name__)
 
 
 class PolarDBXVector(UserDefinedType):
@@ -142,6 +148,13 @@ class PolarDBXSQLDatabase(SQLDatabase):
         )
         db.run_sql("SELECT * FROM my_table")
         db.get_single_table_info("my_table")
+
+    If the database contains a table with corrupted partition metadata,
+    the standard ``SHOW FULL TABLES`` query used during initialization
+    will raise ``TDDL-4700``. This class detects that failure and falls
+    back to a resilient initialization path that queries
+    ``information_schema`` directly and skips tables that cannot be
+    reflected.
     """
 
     @classmethod
@@ -163,6 +176,189 @@ class PolarDBXSQLDatabase(SQLDatabase):
             database_uri = "polardbx+pymysql://" + database_uri[len("mysql://") :]
 
         return super().from_uri(database_uri, engine_args, **kwargs)  # type: ignore[return-value]
+
+    def __init__(
+        self,
+        engine: Engine,
+        schema: Optional[str] = None,
+        metadata: Optional[MetaData] = None,
+        ignore_tables: Optional[List[str]] = None,
+        include_tables: Optional[List[str]] = None,
+        sample_rows_in_table_info: int = 3,
+        indexes_in_table_info: bool = False,
+        custom_table_info: Optional[dict] = None,
+        view_support: bool = False,
+        max_string_length: int = 300,
+    ) -> None:
+        """Initialize with resilient fallback for corrupted table metadata.
+
+        If the standard initialization fails (e.g. due to a table with
+        corrupted partition metadata causing ``TDDL-4700``), falls back
+        to a resilient path that enumerates tables via
+        ``information_schema`` and reflects them individually, skipping
+        any that cannot be reflected.
+        """
+        try:
+            super().__init__(
+                engine,
+                schema=schema,
+                metadata=metadata,
+                ignore_tables=ignore_tables,
+                include_tables=include_tables,
+                sample_rows_in_table_info=sample_rows_in_table_info,
+                indexes_in_table_info=indexes_in_table_info,
+                custom_table_info=custom_table_info,
+                view_support=view_support,
+                max_string_length=max_string_length,
+            )
+        except Exception:
+            logger.warning(
+                "Standard SQLDatabase initialization failed, possibly "
+                "due to corrupted table metadata (TDDL-4700). Falling "
+                "back to resilient initialization."
+            )
+            self._resilient_init(
+                engine=engine,
+                schema=schema,
+                metadata=metadata,
+                ignore_tables=ignore_tables,
+                include_tables=include_tables,
+                sample_rows_in_table_info=sample_rows_in_table_info,
+                indexes_in_table_info=indexes_in_table_info,
+                custom_table_info=custom_table_info,
+                view_support=view_support,
+                max_string_length=max_string_length,
+            )
+
+    def _resilient_init(
+        self,
+        engine: Engine,
+        schema: Optional[str],
+        metadata: Optional[MetaData],
+        ignore_tables: Optional[List[str]],
+        include_tables: Optional[List[str]],
+        sample_rows_in_table_info: int,
+        indexes_in_table_info: bool,
+        custom_table_info: Optional[dict],
+        view_support: bool,
+        max_string_length: int,
+    ) -> None:
+        """Initialize SQLDatabase, skipping tables with corrupted metadata."""
+        if include_tables and ignore_tables:
+            raise ValueError(
+                "Cannot specify both include_tables and ignore_tables"
+            )
+
+        self._engine = engine
+        self._schema = schema
+        self._inspector = sa_inspect(self._engine)
+
+        # Enumerate tables via information_schema, which does not
+        # trigger partition metadata loading (the cause of TDDL-4700).
+        self._all_tables = self._get_tables_from_information_schema(
+            schema, view_support
+        )
+
+        self._include_tables = set(include_tables) if include_tables else set()
+        if self._include_tables:
+            missing = self._include_tables - self._all_tables
+            if missing:
+                raise ValueError(
+                    f"include_tables {missing} not found in database"
+                )
+        self._ignore_tables = set(ignore_tables) if ignore_tables else set()
+        if self._ignore_tables:
+            missing = self._ignore_tables - self._all_tables
+            if missing:
+                raise ValueError(
+                    f"ignore_tables {missing} not found in database"
+                )
+        usable = self.get_usable_table_names()
+        self._usable_tables = (
+            set(usable) if usable else self._all_tables
+        )
+
+        if not isinstance(sample_rows_in_table_info, int):
+            raise TypeError("sample_rows_in_table_info must be an integer")
+        self._sample_rows_in_table_info = sample_rows_in_table_info
+        self._indexes_in_table_info = indexes_in_table_info
+
+        self._custom_table_info = custom_table_info
+        if self._custom_table_info:
+            if not isinstance(self._custom_table_info, dict):
+                raise TypeError(
+                    "table_info must be a dictionary with table names "
+                    "as keys and the desired table info as values"
+                )
+            intersection = set(self._custom_table_info).intersection(
+                self._all_tables
+            )
+            self._custom_table_info = {
+                t: info
+                for t, info in self._custom_table_info.items()
+                if t in intersection
+            }
+
+        self._max_string_length = max_string_length
+
+        # Reflect tables one by one, skipping any that fail.
+        self._metadata = metadata or MetaData()
+        skipped: List[str] = []
+        for table_name in self._usable_tables:
+            try:
+                self._metadata.reflect(
+                    bind=self._engine,
+                    only=[table_name],
+                    schema=self._schema,
+                    views=view_support,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Skipping table '%s' due to reflection error: %s",
+                    table_name,
+                    exc,
+                )
+                skipped.append(table_name)
+
+        if skipped:
+            logger.warning(
+                "Resilient initialization: skipped %d table(s) with "
+                "corrupted metadata: %s",
+                len(skipped),
+                ", ".join(sorted(skipped)),
+            )
+
+    def _get_tables_from_information_schema(
+        self, schema: Optional[str], view_support: bool
+    ) -> Set[str]:
+        """Enumerate tables via information_schema.
+
+        Unlike ``SHOW FULL TABLES``, this query does not trigger
+        partition metadata loading, making it resilient to tables
+        with corrupted partition info (``TDDL-4700``).
+        """
+        with self._engine.connect() as conn:
+            if schema:
+                rows = conn.execute(
+                    text(
+                        "SELECT TABLE_NAME, TABLE_TYPE "
+                        "FROM information_schema.tables "
+                        "WHERE TABLE_SCHEMA = :schema"
+                    ),
+                    {"schema": schema},
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    text(
+                        "SELECT TABLE_NAME, TABLE_TYPE "
+                        "FROM information_schema.tables "
+                        "WHERE TABLE_SCHEMA = DATABASE()"
+                    )
+                ).fetchall()
+            tables = {r[0] for r in rows if r[1] == "BASE TABLE"}
+            if view_support:
+                tables |= {r[0] for r in rows if r[1] == "VIEW"}
+            return tables
 
 
 # ---------------------------------------------------------------------------

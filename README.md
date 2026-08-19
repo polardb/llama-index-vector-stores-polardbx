@@ -281,7 +281,8 @@ Supported filter operators:
 ### MMR Search (Maximal Marginal Relevance)
 
 ```python
-from llama_index.core.vector_stores import VectorStoreQuery, VectorStoreQueryMode
+from llama_index.core.vector_stores import VectorStoreQuery
+from llama_index.core.vector_stores.types import VectorStoreQueryMode
 
 # MMR search for diverse results
 query = VectorStoreQuery(
