@@ -634,7 +634,14 @@ This integration uses PolarDB-X's native vector functions:
 
 ## Error Handling
 
-When using features that require PolarDB-X v3 (e.g. `INNER_PRODUCT` distance, `preload_index`, `explain_index_health`), a `NotSupportedError` is raised on older versions:
+When using features that require PolarDB-X v3, a `NotSupportedError` is raised on older versions. Features that require v3 include:
+
+- `distance_method="INNER_PRODUCT"` (init-time validation)
+- `preload_index()` / `apreload_index()`
+- `preload_check()` / `apreload_check()`
+- `explain_index_health()` / `aexplain_index_health()`
+- Partitioned vector table creation (`partition_by`, `broadcast` on incompatible instances)
+- Partitioned standalone table creation via `create_partitioned_table()` on incompatible instances
 
 ```python
 from llama_index.vector_stores.polardbx import PolarDBXVectorStore, NotSupportedError

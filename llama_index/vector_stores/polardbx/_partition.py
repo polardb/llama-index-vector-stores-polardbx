@@ -117,8 +117,6 @@ def _build_partition_clause(
             )
 
     if locality:
-        # Escape single quotes to prevent injection via LOCALITY value
-        safe_locality = locality.replace("'", "''")
-        parts.append(f"LOCALITY='{safe_locality}'")
+        parts.append(f"LOCALITY={_sql_quote_string(locality)}")
 
     return "".join(f" {p}" for p in parts) if parts else ""

@@ -420,6 +420,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         self._async_session = None
         self._is_initialized = False
         self._capabilities = {}
+        if vector_index_name is not None:
+            self._validate_identifier(vector_index_name)
         self._vector_index_name = vector_index_name
         self._vector_index_checked = False
         self._ef_construction = ef_construction
