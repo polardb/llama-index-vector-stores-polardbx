@@ -28,7 +28,7 @@ dev = [
 
 [project]
 name = "llama-index-vector-stores-polardbx"
-version = "0.1.0"
+version = "0.2.0"
 description = "llama-index vector_stores PolarDB-X integration"
 authors = [
     { name = "PolarDB-X Team" },
