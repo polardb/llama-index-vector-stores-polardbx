@@ -52,6 +52,7 @@ All transaction isolation levels (READ-COMMITTED, REPEATABLE-READ, SERIALIZABLE)
 - **Full Async Support**: All public methods have async equivalents (`async_add`, `aquery`, etc.)
 - **Dual-Version Compatibility**: Automatically detects database capabilities and adapts SQL accordingly
 - **Partitioned Table Support**: Create partitioned vector tables with HASH/KEY/RANGE/LIST strategies, broadcast tables, and LOCALITY node assignment
+- **Custom Column Schema**: Customize column names for all core fields (`id`, `node_id`, `text`, `embedding`, `metadata`) and promote specific metadata keys to dedicated typed columns for faster filtering and indexing
 - **Connection Pooling**: Built-in SQLAlchemy Engine with connection pooling and automatic retry logic
 - **SQL Database Integration**: Use PolarDB-X as a SQL database for LlamaIndex SQL agents with automatic DDL reflection compatibility (tab indentation, ENUM spacing, VECTOR type support)
 
@@ -131,6 +132,8 @@ vector_store = PolarDBXVectorStore.from_params(
 )
 ```
 
+`from_params` accepts all the same parameters as the constructor, including custom column parameters (`id_column`, `metadata_columns`, etc.). See [Configuration Options](#configuration-options) for the full list.
+
 ### Using DashScope Embeddings
 
 ```python
@@ -152,6 +155,113 @@ vector_store = PolarDBXVectorStore(
     embed_dim=1024,
 )
 ```
+
+## Custom Column Schema
+
+By default, the vector store creates a table with five columns: `id`, `node_id`, `text`, `metadata` (JSON), and `embedding` (VECTOR). You can customize column names and promote specific metadata keys to dedicated typed columns for faster filtering and indexing.
+
+### Customizing Core Column Names
+
+```python
+from llama_index.vector_stores.polardbx import PolarDBXVectorStore
+
+vector_store = PolarDBXVectorStore(
+    host="your-host",
+    port=3306,
+    user="your-user",
+    password="your-password",
+    database="your-database",
+    table_name="my_vectors",
+    embed_dim=1536,
+    id_column="my_id",                    # default: "id"
+    node_id_column="my_node_id",           # default: "node_id"
+    text_column="my_text",                 # default: "text"
+    embedding_column="my_embedding",       # default: "embedding"
+    metadata_json_column="my_meta",        # default: "metadata"; set None to disable
+)
+```
+
+### Promoting Metadata to Dedicated Columns
+
+By default, all metadata is stored as a single JSON column. You can promote specific metadata keys to dedicated typed columns for faster filtering (direct column reference instead of `JSON_EXTRACT`) and native indexing.
+
+Use `Column` objects when creating a new table (the `data_type` is included in DDL):
+
+```python
+from llama_index.vector_stores.polardbx import PolarDBXVectorStore, Column
+
+vector_store = PolarDBXVectorStore(
+    host="your-host",
+    port=3306,
+    user="your-user",
+    password="your-password",
+    database="your-database",
+    table_name="my_vectors",
+    embed_dim=1536,
+    metadata_columns=[
+        Column("category", "VARCHAR(64)", nullable=False),
+        Column("lang", "VARCHAR(8)"),
+        Column("price", "DECIMAL(10,2)"),
+    ],
+)
+```
+
+Use plain strings when connecting to an existing table (data type is ignored, taken from the existing schema):
+
+```python
+vector_store = PolarDBXVectorStore(
+    host="your-host",
+    port=3306,
+    user="your-user",
+    password="your-password",
+    database="your-database",
+    table_name="existing_table",
+    embed_dim=1536,
+    perform_setup=False,              # do not auto-create the table
+    metadata_columns=["category", "lang", "price"],
+)
+```
+
+### How Mapped Columns Work
+
+When metadata columns are configured:
+
+- **On insert**: Metadata keys matching mapped column names are extracted to their own columns. Remaining metadata keys (including LlamaIndex internal serialization data) are stored in the JSON column.
+- **On query**: Mapped column values and JSON column values are merged into the metadata dict returned to LlamaIndex.
+- **On filter**: Filters on mapped column keys use direct column references (`WHERE \`category\` = ?`) for better performance. Filters on non-mapped keys use `JSON_EXTRACT` on the JSON column.
+
+### No JSON Column Mode
+
+Set `metadata_json_column=None` to store metadata exclusively in mapped columns, eliminating the JSON column entirely. This is useful for schemas where all metadata keys are known upfront.
+
+```python
+vector_store = PolarDBXVectorStore(
+    ...,
+    metadata_json_column=None,
+    metadata_columns=["category", "lang"],
+)
+```
+
+> **Note**: When `metadata_json_column=None`, filtering on a metadata key that is not a mapped column raises `ValueError`. Ensure all filterable keys are listed in `metadata_columns`.
+
+> **Note**: In no-JSON-column mode, LlamaIndex internal serialization data (e.g., `_node_content`) is not stored. Node reconstruction falls back to creating a basic `TextNode` from the text and mapped metadata columns. This is sufficient for search and retrieval but does not preserve node relationships or other internal metadata.
+
+> **Note**: In no-JSON-column mode, `delete(ref_doc_id)` and `adelete(ref_doc_id)` raise `ValueError` because `ref_doc_id` is stored in the JSON metadata column. Use `delete_nodes(filters=...)` or `delete_by_metadata(filters=...)` instead, or add `ref_doc_id` to `metadata_columns` to enable filtering on a dedicated column.
+
+### Column Class Reference
+
+The `Column` dataclass defines metadata column schema for new table creation:
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `name` | str | (required) | Column name (must match a metadata key) |
+| `data_type` | str | (required) | SQL type, e.g. `"VARCHAR(255)"`, `"INT"`, `"DECIMAL(10,2)"` |
+| `nullable` | bool | `True` | Whether the column allows NULL values |
+| `default` | str | `None` | SQL default expression for DDL, e.g. `"0"`, `"'active'"` |
+
+> **Note**: `data_type` and `default` are validated to prevent SQL injection (no semicolons, comments, or newlines). Only SQL type expressions are allowed.
+
+> **Note**: `default` only affects the DDL schema definition (`DEFAULT` clause in `CREATE TABLE`). It does not auto-fill missing values during `INSERT` through this package. When a metadata key is absent, `nullable=False` columns raise `ValueError`, and `nullable=True` columns insert `NULL`. To auto-fill defaults, provide the value in the metadata dict before calling `add()`.
 
 ## SQL Database
 
@@ -502,9 +612,9 @@ vector_store = PolarDBXVectorStore(
 
 > **Note**: Partitioned vector tables are not supported on certain PolarDB-X v3 instances. The package automatically detects this and raises `NotSupportedError` if you attempt to use partitioning on an incompatible version.
 >
-> **Note**: When partitioning is enabled, the `node_id` UNIQUE INDEX is automatically downgraded to a regular INDEX. PolarDB-X requires that unique indexes include the partition key, and since `node_id` is not the partition key, a UNIQUE constraint would be incompatible with partitioning. The `add()` method automatically adapts: non-partitioned tables use `ON DUPLICATE KEY UPDATE`, while partitioned tables use DELETE-then-INSERT to preserve upsert semantics.
+> **Note**: When partitioning is enabled, the `node_id` UNIQUE INDEX is automatically downgraded to a regular INDEX. PolarDB-X requires that unique indexes include the partition key, and since the `node_id` column (or custom `node_id_column`) is not the partition key, a UNIQUE constraint would be incompatible with partitioning. The `add()` method automatically adapts: non-partitioned tables use `ON DUPLICATE KEY UPDATE`, while partitioned tables use DELETE-then-INSERT to preserve upsert semantics.
 >
-> **Note**: For vector tables, `partition_column` must be `"id"` (the primary key). This is enforced at init time. Use `create_partitioned_table()` if you need to partition on a different column.
+> **Note**: For vector tables, `partition_column` must match the `id_column` value (default: `"id"`). This is enforced at init time. Use `create_partitioned_table()` if you need to partition on a different column.
 >
 > **Note**: LIST partitioning is generally not practical for VectorStore tables because the `id` column is a UUID string — LIST requires exact value enumeration, which is infeasible for UUIDs. Use HASH or KEY partitioning for VectorStore tables instead. LIST partitioning is better suited for `create_partitioned_table()` on tables with known, bounded value sets (e.g., region codes).
 
@@ -607,10 +717,16 @@ Supported partition strategies:
 | `retry_delay` | float | 1.0 | Delay between retry attempts in seconds |
 | `partition_by` | str | None | Partition strategy: `"HASH"`, `"KEY"`, `"RANGE"`, or `"LIST"` |
 | `partitions` | int | 0 | Number of partitions (required for HASH/KEY) |
-| `partition_column` | str | None | Column to partition on (must be `"id"` for vector tables; defaults to `"id"` at runtime) |
+| `partition_column` | str | None | Column to partition on (must match `id_column` value for vector tables; defaults to `id_column` value at runtime) |
 | `broadcast` | bool | False | Create a broadcast table (full copy on every DN) |
 | `locality` | str | None | Pin table to a specific DN node, e.g. `"dn=node-name"` |
 | `partition_defs` | list | None | Partition definitions for RANGE/LIST (see examples above) |
+| `id_column` | str | `"id"` | Custom name for the primary key column (UUID VARCHAR(36)) |
+| `node_id_column` | str | `"node_id"` | Custom name for the LlamaIndex node_id column (VARCHAR(255)) |
+| `text_column` | str | `"text"` | Custom name for the text content column (LONGTEXT) |
+| `embedding_column` | str | `"embedding"` | Custom name for the vector embedding column (VECTOR(N)) |
+| `metadata_json_column` | str | `"metadata"` | Custom name for the JSON metadata column. Set `None` to disable the JSON column (requires `metadata_columns` to be non-empty) |
+| `metadata_columns` | list | None | List of `Column` objects or column name strings to promote metadata keys to dedicated typed columns (see [Custom Column Schema](#custom-column-schema)) |
 | `**kwargs` | - | - | Additional pymysql connection arguments (e.g. `ssl_cert`, `ssl_key`, `ssl_verify_ca`, `ssl_verify_identity`, `ssl_disabled`, `connect_timeout`, `read_timeout`, `write_timeout`, `charset`, `collation`, `autocommit`, `unix_socket`) |
 
 ## PolarDB-X Vector Functions Used

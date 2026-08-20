@@ -556,8 +556,8 @@ class TestVectorStorePartitionValidation:
     def test_invalid_partition_column(self) -> None:
         from llama_index.vector_stores.polardbx import PolarDBXVectorStore
 
-        # W4: Vector tables only allow partition_column="id"
-        with pytest.raises(ValueError, match="partition_column must be 'id'"):
+        # W4: Vector tables only allow partition_column matching id_column
+        with pytest.raises(ValueError, match="partition_column must match"):
             PolarDBXVectorStore(
                 host="localhost",
                 port=3306,
@@ -1524,10 +1524,10 @@ class TestReviewV2Fixes:
         assert vs._partition_column == "id"
 
     def test_w4_non_id_partition_column_rejected(self) -> None:
-        """W4: partition_column other than 'id' is rejected for vector tables."""
+        """W4: partition_column other than id_column is rejected for vector tables."""
         from llama_index.vector_stores.polardbx import PolarDBXVectorStore
 
-        with pytest.raises(ValueError, match="partition_column must be 'id'"):
+        with pytest.raises(ValueError, match="partition_column must match"):
             PolarDBXVectorStore(
                 host="localhost",
                 port=3306,

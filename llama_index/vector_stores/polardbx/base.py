@@ -26,6 +26,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    Union,
 )
 from urllib.parse import quote_plus
 
@@ -47,6 +48,7 @@ from llama_index.core.vector_stores.utils import (
     metadata_dict_to_node,
     node_to_metadata_dict,
 )
+from llama_index.vector_stores.polardbx.column import Column
 
 _logger = logging.getLogger(__name__)
 
@@ -91,6 +93,12 @@ _OWN_PARAMS: set = {
     "broadcast",
     "locality",
     "partition_defs",
+    "id_column",
+    "node_id_column",
+    "text_column",
+    "embedding_column",
+    "metadata_json_column",
+    "metadata_columns",
 }
 
 # pymysql / SQLAlchemy connect_args that users may pass via **kwargs
@@ -175,6 +183,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     _connection_retries: int = PrivateAttr(default=3)
     _retry_delay: float = PrivateAttr(default=1.0)
     _lock: Any = PrivateAttr(default_factory=threading.Lock)
+
+    # Custom column configuration (Phase: custom column support)
+    _id_column: str = PrivateAttr(default="id")
+    _node_id_column: str = PrivateAttr(default="node_id")
+    _text_column: str = PrivateAttr(default="text")
+    _embedding_column: str = PrivateAttr(default="embedding")
+    _metadata_json_column: Optional[str] = PrivateAttr(default="metadata")
+    _metadata_column_objs: List[Column] = PrivateAttr(default_factory=list)
+    _metadata_column_names: List[str] = PrivateAttr(default_factory=list)
 
     # ------------------------------------------------------------------
     # Security: prevent credential leakage in repr/dump
@@ -281,6 +298,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         broadcast: bool = False,
         locality: Optional[str] = None,
         partition_defs: Optional[List[Dict[str, Any]]] = None,
+        id_column: Optional[str] = None,
+        node_id_column: Optional[str] = None,
+        text_column: Optional[str] = None,
+        embedding_column: Optional[str] = None,
+        metadata_json_column: Optional[str] = "metadata",
+        metadata_columns: Optional[List[Union[Column, str]]] = None,
         **kwargs: Any,
     ) -> None:
         """Initialize the PolarDB-X vector store.
@@ -329,6 +352,25 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 strategies. Each dict has a ``"name"`` key and either
                 ``"values_less_than"`` (RANGE) or ``"values_in"`` (LIST).
                 Defaults to None.
+            id_column: Custom name for the primary key column.
+                Defaults to ``"id"``.
+            node_id_column: Custom name for the LlamaIndex node_id
+                column. Defaults to ``"node_id"``.
+            text_column: Custom name for the text content column.
+                Defaults to ``"text"``.
+            embedding_column: Custom name for the vector embedding
+                column. Defaults to ``"embedding"``.
+            metadata_json_column: Custom name for the JSON metadata
+                column. Set to None to disable the JSON metadata column
+                (requires metadata_columns). Defaults to ``"metadata"``.
+            metadata_columns: List of Column objects or column name
+                strings for dedicated metadata columns. Column objects
+                require a data_type (e.g. ``Column("price", "DECIMAL(10,2)")``)
+                and are used when creating a new table. String names
+                (e.g. ``"category"``) are used when connecting to an
+                existing table. Mapped keys are extracted from the
+                metadata dict into their own columns; remaining keys
+                go into the JSON metadata column. Defaults to None.
         """
         self._validate_kwargs(kwargs)
 
@@ -383,16 +425,85 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 "broadcast and partition_by are mutually exclusive. "
                 "Use one or the other."
             )
-        _pcolumn = partition_column or "id"
-        if _pby and _pcolumn != "id":
-            # W4: Vector table schema is fixed (id, node_id, text,
-            # metadata, embedding). PolarDB-X requires the partition key
-            # to be part of every unique index. The only unique index is
-            # PRIMARY KEY(id), so partition_column must be "id".
+
+        # ------------------------------------------------------------------
+        # Custom column validation and normalization
+        # ------------------------------------------------------------------
+        _id_col = id_column or "id"
+        _node_id_col = node_id_column or "node_id"
+        _text_col = text_column or "text"
+        _emb_col = embedding_column or "embedding"
+        self._validate_identifier(_id_col)
+        self._validate_identifier(_node_id_col)
+        self._validate_identifier(_text_col)
+        self._validate_identifier(_emb_col)
+        if metadata_json_column is not None:
+            self._validate_identifier(metadata_json_column)
+
+        # Partition column validation (must be after _id_col computation
+        # so that custom id_column names are properly validated)
+        _pcolumn = partition_column or _id_col
+        if _pby and _pcolumn != _id_col:
+            # W4: PolarDB-X requires the partition key to be part of
+            # every unique index. The only unique index is PRIMARY KEY,
+            # so partition_column must match the id_column.
             raise ValueError(
-                "For vector tables, partition_column must be 'id'. "
-                "The vector table schema only supports partitioning on "
-                "the primary key column."
+                f"For vector tables, partition_column must match "
+                f"id_column (got partition_column={_pcolumn!r}, "
+                f"id_column={_id_col!r}). The vector table schema only "
+                f"supports partitioning on the primary key column."
+            )
+
+        # Normalize metadata_columns: extract Column names, keep Column
+        # objects for DDL generation
+        _metadata_col_objs: List[Column] = []
+        _metadata_col_names: List[str] = []
+        if metadata_columns:
+            for mc in metadata_columns:
+                if isinstance(mc, Column):
+                    self._validate_identifier(mc.name)
+                    _metadata_col_objs.append(mc)
+                    _metadata_col_names.append(mc.name)
+                elif isinstance(mc, str):
+                    self._validate_identifier(mc)
+                    _metadata_col_names.append(mc)
+                else:
+                    raise TypeError(
+                        f"metadata_columns items must be Column or str, "
+                        f"got {type(mc).__name__}"
+                    )
+
+        # Detect duplicate column names
+        all_col_names = [_id_col, _node_id_col, _text_col, _emb_col]
+        if metadata_json_column is not None:
+            all_col_names.append(metadata_json_column)
+        seen: set = set()
+        for name in all_col_names:
+            if name in seen:
+                raise ValueError(
+                    f"Duplicate column name '{name}'. "
+                    "Column names must be unique."
+                )
+            seen.add(name)
+        for name in _metadata_col_names:
+            if name in seen:
+                raise ValueError(
+                    f"Duplicate column name '{name}'. "
+                    "metadata_columns names must not overlap with "
+                    "core column names or each other."
+                )
+            seen.add(name)
+
+        # If no JSON column and no metadata_columns, all metadata is lost
+        if (
+            metadata_json_column is None
+            and not _metadata_col_names
+        ):
+            raise ValueError(
+                "metadata_json_column is None and "
+                "metadata_columns is empty. There is no place to "
+                "store unmapped metadata. Set metadata_json_column "
+                "to a column name, or provide metadata_columns."
             )
 
         password_safe = quote_plus(password)
@@ -438,6 +549,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         self._partition_defs = partition_defs
         self._lock = threading.Lock()
 
+        # Custom column configuration
+        self._id_column = _id_col
+        self._node_id_column = _node_id_col
+        self._text_column = _text_col
+        self._embedding_column = _emb_col
+        self._metadata_json_column = metadata_json_column
+        self._metadata_column_objs = _metadata_col_objs
+        self._metadata_column_names = _metadata_col_names
+
         self._initialize()
 
     @classmethod
@@ -470,6 +590,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         broadcast: bool = False,
         locality: Optional[str] = None,
         partition_defs: Optional[List[Dict[str, Any]]] = None,
+        id_column: Optional[str] = None,
+        node_id_column: Optional[str] = None,
+        text_column: Optional[str] = None,
+        embedding_column: Optional[str] = None,
+        metadata_json_column: Optional[str] = "metadata",
+        metadata_columns: Optional[List[Union[Column, str]]] = None,
         **kwargs: Any,
     ) -> "PolarDBXVectorStore":
         """Construct from parameters (factory method)."""
@@ -497,6 +623,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             broadcast=broadcast,
             locality=locality,
             partition_defs=partition_defs,
+            id_column=id_column,
+            node_id_column=node_id_column,
+            text_column=text_column,
+            embedding_column=embedding_column,
+            metadata_json_column=metadata_json_column,
+            metadata_columns=metadata_columns,
             **kwargs,
         )
 
@@ -899,40 +1031,56 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Return True if the table uses partitioning or broadcast."""
         return self._broadcast or self._partition_by is not None
 
+    @property
+    def _has_custom_columns(self) -> bool:
+        """True if custom column configuration differs from defaults."""
+        return (
+            self._id_column != "id"
+            or self._node_id_column != "node_id"
+            or self._text_column != "text"
+            or self._embedding_column != "embedding"
+            or bool(self._metadata_column_names)
+            or self._metadata_json_column != "metadata"
+        )
+
     def _create_table_if_not_exists(self) -> None:
         """Create the vector table if it does not exist."""
         from sqlalchemy import text
 
-        # Build optional EF_CONSTRUCTION clause (v3 only)
-        ef_clause = ""
-        if (
-            self._ef_construction is not None
-            and self._capabilities.get("vec_dim", False)
-        ):
-            ef_clause = f" EF_CONSTRUCTION={self._ef_construction}"
+        if self._has_custom_columns:
+            base_ddl = self._build_create_table_sql_custom()
+        else:
+            # Build optional EF_CONSTRUCTION clause (v3 only)
+            ef_clause = ""
+            if (
+                self._ef_construction is not None
+                and self._capabilities.get("vec_dim", False)
+            ):
+                ef_clause = f" EF_CONSTRUCTION={self._ef_construction}"
 
-        # When partitioning is enabled, PolarDB-X requires that unique
-        # indexes include the partition key. The node_id unique index does
-        # not include the partition key (default: id), so downgrade it
-        # to a regular INDEX. The id PRIMARY KEY already guarantees row
-        # uniqueness, and LlamaIndex handles dedup at the app level.
-        node_index_type = (
-            "INDEX" if self._has_partition else "UNIQUE INDEX"
-        )
+            # When partitioning is enabled, PolarDB-X requires that unique
+            # indexes include the partition key. The node_id unique index
+            # does not include the partition key (default: id), so
+            # downgrade it to a regular INDEX. The id PRIMARY KEY already
+            # guarantees row uniqueness, and LlamaIndex handles dedup at
+            # the app level.
+            node_index_type = (
+                "INDEX" if self._has_partition else "UNIQUE INDEX"
+            )
+
+            base_ddl = f"""
+            CREATE TABLE IF NOT EXISTS `{self.table_name}` (
+                id VARCHAR(36) PRIMARY KEY,
+                node_id VARCHAR(255) NOT NULL,
+                text LONGTEXT,
+                metadata JSON,
+                embedding VECTOR({self.embed_dim}) NOT NULL,
+                {node_index_type} `node_id_index` (node_id),
+                VECTOR INDEX `vi` (embedding) M={self.default_m}{ef_clause} DISTANCE={self.distance_method}
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
 
         partition_clause = self._build_partition_clause()
-        # Strip trailing semicolon — partition clause goes before it
-        base_ddl = f"""
-        CREATE TABLE IF NOT EXISTS `{self.table_name}` (
-            id VARCHAR(36) PRIMARY KEY,
-            node_id VARCHAR(255) NOT NULL,
-            text LONGTEXT,
-            metadata JSON,
-            embedding VECTOR({self.embed_dim}) NOT NULL,
-            {node_index_type} `node_id_index` (node_id),
-            VECTOR INDEX `vi` (embedding) M={self.default_m}{ef_clause} DISTANCE={self.distance_method}
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
-        """
         stmt = text(base_ddl + partition_clause + ";")
         with self._session() as session:
             try:
@@ -955,6 +1103,82 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                         ) from e
                 raise
 
+    def _build_create_table_sql_custom(self) -> str:
+        """Build CREATE TABLE SQL with custom column definitions.
+
+        Generates DDL using the user-specified column names and
+        metadata column definitions. Falls back to sensible defaults
+        for the core columns (id, node_id, text, embedding).
+        """
+        # Build optional EF_CONSTRUCTION clause (v3 only)
+        index_extra = ""
+        if (
+            self._ef_construction is not None
+            and self._capabilities.get("vec_dim", False)
+        ):
+            index_extra = f" EF_CONSTRUCTION={self._ef_construction}"
+
+        # When partitioning is enabled, PolarDB-X requires that unique
+        # indexes include the partition key. The node_id unique index does
+        # not include the partition key (default: id), so downgrade it
+        # to a regular INDEX.
+        node_index_type = (
+            "INDEX" if self._has_partition else "UNIQUE INDEX"
+        )
+
+        lines: List[str] = []
+        lines.append(
+            f"    `{self._id_column}` VARCHAR(36) PRIMARY KEY"
+        )
+        lines.append(
+            f"    `{self._node_id_column}` VARCHAR(255) NOT NULL"
+        )
+        lines.append(
+            f"    `{self._text_column}` LONGTEXT"
+        )
+        if self._metadata_json_column is not None:
+            lines.append(
+                f"    `{self._metadata_json_column}` JSON"
+            )
+        lines.append(
+            f"    `{self._embedding_column}` "
+            f"VECTOR({self.embed_dim}) NOT NULL"
+        )
+        # node_id index
+        lines.append(
+            f"    {node_index_type} `node_id_index` "
+            f"({self._node_id_column})"
+        )
+        # vector index
+        lines.append(
+            f"    VECTOR INDEX `vi` ({self._embedding_column}) "
+            f"M={self.default_m}{index_extra} "
+            f"DISTANCE={self.distance_method}"
+        )
+        # Add metadata columns: use Column objects when available
+        # (for new tables), fall back to TEXT for string-only names
+        col_obj_map = {c.name: c for c in self._metadata_column_objs}
+        for name in self._metadata_column_names:
+            col = col_obj_map.get(name)
+            if col is not None:
+                col_def = f"    `{name}` {col.data_type}"
+                if not col.nullable:
+                    col_def += " NOT NULL"
+                if col.default is not None:
+                    col_def += f" DEFAULT {col.default}"
+            else:
+                # String-only column name: use TEXT as default type
+                col_def = f"    `{name}` TEXT"
+            lines.append(col_def)
+
+        inner = ",\n".join(lines)
+        return (
+            f"CREATE TABLE IF NOT EXISTS `{self.table_name}` (\n"
+            f"{inner}\n"
+            f") ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 "
+            f"COLLATE=utf8mb4_unicode_ci\n"
+        )
+
     def _node_to_table_row(self, node: BaseNode) -> Dict[str, Any]:
         """Convert a LlamaIndex node to a table row dict."""
         return {
@@ -967,6 +1191,254 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 flat_metadata=self.flat_metadata,
             ),
         }
+
+    # ------------------------------------------------------------------
+    # SQL builder methods for UPSERT (INSERT + ON DUPLICATE KEY UPDATE)
+    # ------------------------------------------------------------------
+
+    def _build_upsert_sql(self, partitioned: bool) -> str:
+        """Build INSERT SQL for adding a node.
+
+        When custom columns are not configured, uses the original
+        static SQL.  When custom columns are configured, dynamically
+        generates the column list and value placeholders.
+
+        Args:
+            partitioned: If True, use plain INSERT (no ON DUPLICATE KEY
+                UPDATE) because partitioned tables use DELETE-then-INSERT.
+
+        Returns:
+            The INSERT SQL statement.
+        """
+        if not self._has_custom_columns:
+            if partitioned:
+                return f"""
+                INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
+                VALUES (
+                    UUID(),
+                    :node_id,
+                    :text,
+                    VEC_FROMTEXT(:embedding),
+                    :metadata
+                )
+                """
+            return f"""
+            INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
+            VALUES (
+                UUID(),
+                :node_id,
+                :text,
+                VEC_FROMTEXT(:embedding),
+                :metadata
+            )
+            ON DUPLICATE KEY UPDATE
+                text = VALUES(text),
+                embedding = VALUES(embedding),
+                metadata = VALUES(metadata)
+            """
+
+        # Custom column mode: dynamically build column list
+        # Order: id, node_id, text, [metadata_json], embedding,
+        #        [metadata_col1, metadata_col2, ...]
+        cols: List[str] = [
+            f"`{self._id_column}`",
+            f"`{self._node_id_column}`",
+            f"`{self._text_column}`",
+        ]
+        placeholders: List[str] = [
+            "UUID()",
+            ":node_id",
+            ":text",
+        ]
+        if self._metadata_json_column is not None:
+            cols.append(f"`{self._metadata_json_column}`")
+            placeholders.append(":metadata")
+        cols.append(f"`{self._embedding_column}`")
+        placeholders.append("VEC_FROMTEXT(:embedding)")
+
+        # Metadata columns
+        for name in self._metadata_column_names:
+            cols.append(f"`{name}`")
+            placeholders.append(f":meta_{name}")
+
+        col_list = ", ".join(cols)
+        val_list = ", ".join(placeholders)
+
+        if partitioned:
+            return (
+                f"INSERT INTO `{self.table_name}` ({col_list})\n"
+                f"VALUES ({val_list})\n"
+            )
+
+        # ON DUPLICATE KEY UPDATE: all columns except primary key
+        update_cols = cols[1:]
+        update_clause = ",\n    ".join(
+            f"{c} = VALUES({c})" for c in update_cols
+        )
+        return (
+            f"INSERT INTO `{self.table_name}` ({col_list})\n"
+            f"VALUES ({val_list})\n"
+            f"ON DUPLICATE KEY UPDATE\n    {update_clause}\n"
+        )
+
+    def _build_upsert_params(
+        self, item: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Build the parameter dict for the INSERT SQL.
+
+        When custom columns are configured, extracts mapped metadata
+        keys into their own parameters (prefixed ``meta_``) and puts
+        the remaining metadata into the JSON parameter.
+
+        Args:
+            item: The table row dict from _node_to_table_row.
+
+        Returns:
+            Dict of parameter names to values.
+        """
+        if not self._has_custom_columns:
+            return {
+                "node_id": item["node_id"],
+                "text": item["text"],
+                "embedding": json.dumps(item["embedding"]),
+                "metadata": json.dumps(item["metadata"]),
+            }
+
+        params: Dict[str, Any] = {
+            "node_id": item["node_id"],
+            "text": item["text"],
+        }
+        if self._metadata_json_column is not None:
+            # Keys mapped to dedicated columns are excluded from JSON
+            remaining = {
+                k: v
+                for k, v in item["metadata"].items()
+                if k not in self._metadata_column_names
+            }
+            params["metadata"] = json.dumps(remaining)
+        params["embedding"] = json.dumps(item["embedding"])
+
+        # Metadata column values with NOT NULL validation
+        col_obj_map = {c.name: c for c in self._metadata_column_objs}
+        meta = item.get("metadata", {})
+        for name in self._metadata_column_names:
+            val = meta.get(name)
+            if val is None:
+                col = col_obj_map.get(name)
+                if col is not None and not col.nullable:
+                    raise ValueError(
+                        f"Column '{name}' is NOT NULL but no value "
+                        f"was provided in metadata. Provide a value "
+                        f"for '{name}' in the metadata dict, or set "
+                        f"nullable=True on the Column definition. "
+                        f"Note: Column.default only affects DDL schema "
+                        f"definition and does not auto-fill missing "
+                        f"values during INSERT."
+                    )
+            params[f"meta_{name}"] = val
+        return params
+
+    # ------------------------------------------------------------------
+    # SQL builder methods for SELECT (similarity search)
+    # ------------------------------------------------------------------
+
+    def _build_select_columns(self) -> str:
+        """Build the SELECT column list with stable aliases.
+
+        Core columns (node_id, text, metadata) are aliased so that
+        result-mapping code can always access them as ``item[0]``,
+        ``item[1]``, ``item[2]`` regardless of the actual column names.
+        Metadata columns are appended after the core columns.
+
+        Returns:
+            Column list string for use in a SELECT clause.
+        """
+        if not self._has_custom_columns:
+            return "node_id, text, metadata"
+
+        cols: List[str] = [
+            f"`{self._node_id_column}` AS `node_id`",
+            f"`{self._text_column}` AS `text`",
+        ]
+        if self._metadata_json_column is not None:
+            cols.append(
+                f"`{self._metadata_json_column}` AS `metadata`"
+            )
+        for name in self._metadata_column_names:
+            cols.append(f"`{name}`")
+        return ", ".join(cols)
+
+    def _build_search_sql(
+        self,
+        distance_func: str,
+        index_hint: str,
+        where_clause: str,
+    ) -> str:
+        """Build the similarity search SQL.
+
+        Args:
+            distance_func: Distance function name (e.g. VEC_DISTANCE).
+            index_hint: Index hint clause (e.g. "/*+ ... */").
+            where_clause: Optional WHERE clause (may be empty).
+
+        Returns:
+            The complete SELECT ... ORDER BY ... LIMIT SQL.
+        """
+        select_cols = self._build_select_columns()
+        emb_col = self._embedding_column
+
+        return (
+            f"SELECT\n"
+            f"    {select_cols},\n"
+            f"    {distance_func}(`{emb_col}`, "
+            f"VEC_FROMTEXT(:query_embedding)) AS distance\n"
+            f"FROM `{self.table_name}`{index_hint}\n"
+            f"{where_clause}\n"
+            f"ORDER BY distance\n"
+            f"LIMIT :limit"
+        )
+
+    def _build_get_nodes_select(self) -> str:
+        """Build SELECT columns for get_nodes/search_by_metadata.
+
+        Returns the column list for a metadata-only SELECT (no
+        vector distance).  The first three columns are always
+        node_id, text, metadata (aliased).
+        """
+        return self._build_select_columns()
+
+    def _record_to_metadata(self, row: Any) -> dict:
+        """Reconstruct metadata dict from a database row.
+
+        For the default schema, simply deserializes the JSON column.
+        For custom columns, merges the JSON column (if present) with
+        the mapped metadata column values from the row.
+
+        Args:
+            row: A SQLAlchemy Row object.  The first columns are
+                node_id (0), text (1), then optionally metadata (2),
+                and any metadata columns follow.
+
+        Returns:
+            The metadata dictionary.
+        """
+        if not self._has_custom_columns:
+            return self._parse_metadata(row[2])
+
+        metadata: dict = {}
+        # Determine the starting index for metadata columns
+        if self._metadata_json_column is not None:
+            json_data = row[2]  # aliased as 'metadata'
+            metadata.update(self._parse_metadata(json_data))
+            meta_start = 3
+        else:
+            meta_start = 2
+        # Mapped column values override
+        for i, name in enumerate(self._metadata_column_names):
+            val = row[meta_start + i]
+            if val is not None:
+                metadata[name] = val
+        return metadata
 
     def _validate_embedding_dimensions(
         self, nodes: Sequence[BaseNode]
@@ -1052,6 +1524,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         Uses JSON_UNQUOTE(JSON_EXTRACT(...)) instead of JSON_VALUE
         because PolarDB-X does not support the JSON_VALUE function.
+
+        When custom columns are enabled, if the filter key matches a
+        mapped metadata column name, the filter uses a direct column
+        reference instead of JSON_EXTRACT.
         """
         self._validate_metadata_key(filter_.key)
         params: Dict[str, Any] = {}
@@ -1084,11 +1560,35 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             filter_value = f":{param_name}"
             params[param_name] = filter_.value
 
-        # PolarDB-X: JSON_UNQUOTE(JSON_EXTRACT(...)) instead of JSON_VALUE
-        clause = (
-            f"JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.{filter_.key}')) "
-            f"{self._to_mysql_operator(filter_.operator)} {filter_value}"
-        )
+        # Determine the left-hand side of the filter expression
+        if self._has_custom_columns:
+            if filter_.key in self._metadata_column_names:
+                # Mapped column: direct column reference
+                lhs = f"`{filter_.key}`"
+            elif self._metadata_json_column is not None:
+                # JSON column: use JSON_EXTRACT on custom column
+                lhs = (
+                    f"JSON_UNQUOTE(JSON_EXTRACT("
+                    f"`{self._metadata_json_column}`, "
+                    f"'$.{filter_.key}'))"
+                )
+            else:
+                raise ValueError(
+                    f"Cannot filter on '{filter_.key}': no JSON "
+                    f"metadata column configured and "
+                    f"'{filter_.key}' is not a mapped metadata "
+                    f"column. Either set metadata_json_column to "
+                    f"a column name, or add '{filter_.key}' to "
+                    f"metadata_columns."
+                )
+        else:
+            # Default schema: use hardcoded metadata column
+            lhs = (
+                f"JSON_UNQUOTE(JSON_EXTRACT(metadata, "
+                f"'$.{filter_.key}'))"
+            )
+
+        clause = f"{lhs} {self._to_mysql_operator(filter_.operator)} {filter_value}"
         return clause, params
 
     def _filters_to_where_clause(
@@ -1133,6 +1633,46 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         return f" {conditions[filters.condition]} ".join(clauses), all_params
 
+    def _reconstruct_node(
+        self, metadata: dict, text: str, node_id: Optional[str] = None
+    ) -> BaseNode:
+        """Reconstruct a node from metadata and text.
+
+        Tries ``metadata_dict_to_node`` first (full reconstruction
+        using internal serialization keys like ``_node_content``).
+        Falls back to creating a ``TextNode`` directly when those
+        keys are absent — this happens when the store has no JSON
+        metadata column and only mapped columns are available.
+
+        Args:
+            metadata: The metadata dict from the database row.
+            text: The text content from the database row.
+            node_id: Optional node_id to set on the reconstructed node.
+
+        Returns:
+            A ``BaseNode`` with content and metadata populated.
+        """
+        if metadata and "_node_content" in metadata:
+            node = metadata_dict_to_node(metadata)
+        else:
+            # No internal serialization keys — create a basic TextNode.
+            # This happens in no-JSON-column mode where only mapped
+            # metadata columns are stored.
+            from llama_index.core.schema import TextNode
+
+            node = TextNode(
+                id_=node_id or metadata.get("node_id", ""),
+                text=text,
+                metadata={
+                    k: v for k, v in metadata.items()
+                    if not k.startswith("_")
+                },
+            )
+        node.set_content(str(text))
+        if node_id is not None:
+            node.node_id = str(node_id)
+        return node
+
     def _db_rows_to_query_result(
         self, rows: List[DBEmbeddingRow]
     ) -> VectorStoreQueryResult:
@@ -1141,8 +1681,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         similarities = []
         ids = []
         for db_row in rows:
-            node = metadata_dict_to_node(db_row.metadata)
-            node.set_content(str(db_row.text))
+            node = self._reconstruct_node(
+                metadata=db_row.metadata,
+                text=db_row.text,
+                node_id=db_row.node_id,
+            )
             similarities.append(db_row.similarity)
             ids.append(db_row.node_id)
             nodes.append(node)
@@ -1320,9 +1863,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             return {}
 
         emb_expr = (
-            "VEC_TOTEXT(embedding)"
+            f"VEC_TOTEXT(`{self._embedding_column}`)"
             if self._capabilities.get("vec_totext", False)
-            else "CAST(embedding AS CHAR)"
+            else f"CAST(`{self._embedding_column}` AS CHAR)"
         )
 
         # Chunk to avoid SQL length limits
@@ -1335,9 +1878,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
             params = {f"nid_{i}": nid for i, nid in enumerate(chunk)}
             stmt = sqlalchemy.text(
-                f"SELECT node_id, {emb_expr} AS emb_str "
+                f"SELECT `{self._node_id_column}`, {emb_expr} AS emb_str "
                 f"FROM `{self.table_name}` "
-                f"WHERE node_id IN ({placeholders})"
+                f"WHERE `{self._node_id_column}` IN ({placeholders})"
             )
             try:
                 with self._session() as session:
@@ -1365,9 +1908,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             return {}
 
         emb_expr = (
-            "VEC_TOTEXT(embedding)"
+            f"VEC_TOTEXT(`{self._embedding_column}`)"
             if self._capabilities.get("vec_totext", False)
-            else "CAST(embedding AS CHAR)"
+            else f"CAST(`{self._embedding_column}` AS CHAR)"
         )
 
         result: Dict[str, List[float]] = {}
@@ -1379,9 +1922,9 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             )
             params = {f"nid_{i}": nid for i, nid in enumerate(chunk)}
             stmt = sqlalchemy.text(
-                f"SELECT node_id, {emb_expr} AS emb_str "
+                f"SELECT `{self._node_id_column}`, {emb_expr} AS emb_str "
                 f"FROM `{self.table_name}` "
-                f"WHERE node_id IN ({placeholders})"
+                f"WHERE `{self._node_id_column}` IN ({placeholders})"
             )
             try:
                 async with self._async_session() as session:
@@ -1547,6 +2090,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             raise ValueError(
                 f"batch_size must be a positive integer, got {batch_size}"
             )
+        is_partitioned = self._has_partition
         ids: List[str] = []
         for start in range(0, len(nodes), batch_size):
             batch = nodes[start : start + batch_size]
@@ -1555,51 +2099,24 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     ids.append(node.node_id)
                     item = self._node_to_table_row(node)
 
-                    if self._has_partition:
+                    if is_partitioned:
                         # W2: Partitioned tables downgrade node_id unique
                         # index to regular INDEX, so ON DUPLICATE KEY
                         # UPDATE cannot detect duplicates. Use
                         # DELETE-then-INSERT to preserve upsert semantics.
                         del_stmt = sqlalchemy.text(
                             f"DELETE FROM `{self.table_name}` "
-                            f"WHERE node_id = :node_id"
+                            f"WHERE `{self._node_id_column}` = :node_id"
                         )
                         session.execute(
                             del_stmt, {"node_id": item["node_id"]}
                         )
-                        stmt = sqlalchemy.text(f"""
-                        INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
-                        VALUES (
-                            UUID(),
-                            :node_id,
-                            :text,
-                            VEC_FROMTEXT(:embedding),
-                            :metadata
-                        )
-                        """)
-                    else:
-                        stmt = sqlalchemy.text(f"""
-                        INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
-                        VALUES (
-                            UUID(),
-                            :node_id,
-                            :text,
-                            VEC_FROMTEXT(:embedding),
-                            :metadata
-                        )
-                        ON DUPLICATE KEY UPDATE
-                            text = VALUES(text),
-                            embedding = VALUES(embedding),
-                            metadata = VALUES(metadata)
-                        """)
+                    stmt = sqlalchemy.text(
+                        self._build_upsert_sql(partitioned=is_partitioned)
+                    )
                     session.execute(
                         stmt,
-                        {
-                            "node_id": item["node_id"],
-                            "text": item["text"],
-                            "embedding": json.dumps(item["embedding"]),
-                            "metadata": json.dumps(item["metadata"]),
-                        },
+                        self._build_upsert_params(item),
                     )
                 session.commit()
         return ids
@@ -1629,6 +2146,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             raise ValueError(
                 f"batch_size must be a positive integer, got {batch_size}"
             )
+        is_partitioned = self._has_partition
         ids: List[str] = []
         for start in range(0, len(nodes), batch_size):
             batch = nodes[start : start + batch_size]
@@ -1637,48 +2155,21 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     ids.append(node.node_id)
                     item = self._node_to_table_row(node)
 
-                    if self._has_partition:
+                    if is_partitioned:
                         # W2: DELETE-then-INSERT for partitioned tables
                         del_stmt = sqlalchemy.text(
                             f"DELETE FROM `{self.table_name}` "
-                            f"WHERE node_id = :node_id"
+                            f"WHERE `{self._node_id_column}` = :node_id"
                         )
                         await session.execute(
                             del_stmt, {"node_id": item["node_id"]}
                         )
-                        stmt = sqlalchemy.text(f"""
-                        INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
-                        VALUES (
-                            UUID(),
-                            :node_id,
-                            :text,
-                            VEC_FROMTEXT(:embedding),
-                            :metadata
-                        )
-                        """)
-                    else:
-                        stmt = sqlalchemy.text(f"""
-                        INSERT INTO `{self.table_name}` (id, node_id, text, embedding, metadata)
-                        VALUES (
-                            UUID(),
-                            :node_id,
-                            :text,
-                            VEC_FROMTEXT(:embedding),
-                            :metadata
-                        )
-                        ON DUPLICATE KEY UPDATE
-                            text = VALUES(text),
-                            embedding = VALUES(embedding),
-                            metadata = VALUES(metadata)
-                        """)
+                    stmt = sqlalchemy.text(
+                        self._build_upsert_sql(partitioned=is_partitioned)
+                    )
                     await session.execute(
                         stmt,
-                        {
-                            "node_id": item["node_id"],
-                            "text": item["text"],
-                            "embedding": json.dumps(item["embedding"]),
-                            "metadata": json.dumps(item["metadata"]),
-                        },
+                        self._build_upsert_params(item),
                     )
                 await session.commit()
         return ids
@@ -1753,17 +2244,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             where_clause = f"WHERE {where_clause}"
             params.update(filter_params)
 
-        stmt = sqlalchemy.text(f"""
-        SELECT
-            node_id,
-            text,
-            metadata,
-            {distance_func}(embedding, VEC_FROMTEXT(:query_embedding)) AS distance
-        FROM `{self.table_name}`{index_hint}
-        {where_clause}
-        ORDER BY distance
-        LIMIT :limit
-        """)
+        stmt = sqlalchemy.text(
+            self._build_search_sql(
+                distance_func=distance_func,
+                index_hint=index_hint,
+                where_clause=where_clause,
+            )
+        )
 
         with self._session() as session:
             self._set_ef_search_sync(session, ef_search)
@@ -1772,14 +2259,14 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         rows = []
         for item in results:
-            meta = self._parse_metadata(item[2])
+            meta = self._record_to_metadata(item)
             rows.append(
                 DBEmbeddingRow(
                     node_id=item[0],
                     text=item[1],
                     metadata=meta,
-                    similarity=self._distance_to_similarity(item[3])
-                    if item[3] is not None
+                    similarity=self._distance_to_similarity(item[-1])
+                    if item[-1] is not None
                     else 0.0,
                 )
             )
@@ -1874,17 +2361,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             where_clause = f"WHERE {where_clause}"
             params.update(filter_params)
 
-        stmt = sqlalchemy.text(f"""
-        SELECT
-            node_id,
-            text,
-            metadata,
-            {distance_func}(embedding, VEC_FROMTEXT(:query_embedding)) AS distance
-        FROM `{self.table_name}`{index_hint}
-        {where_clause}
-        ORDER BY distance
-        LIMIT :limit
-        """)
+        stmt = sqlalchemy.text(
+            self._build_search_sql(
+                distance_func=distance_func,
+                index_hint=index_hint,
+                where_clause=where_clause,
+            )
+        )
 
         async with self._async_session() as session:
             await self._set_ef_search_async(session, ef_search)
@@ -1893,14 +2376,14 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
 
         rows = []
         for item in results:
-            meta = self._parse_metadata(item[2])
+            meta = self._record_to_metadata(item)
             rows.append(
                 DBEmbeddingRow(
                     node_id=item[0],
                     text=item[1],
                     metadata=meta,
-                    similarity=self._distance_to_similarity(item[3])
-                    if item[3] is not None
+                    similarity=self._distance_to_similarity(item[-1])
+                    if item[-1] is not None
                     else 0.0,
                 )
             )
@@ -1963,14 +2446,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                         for i, nid in enumerate(chunk)
                     }
                     stmt = sqlalchemy.text(
-                        f"SELECT text, metadata FROM `{self.table_name}` "
-                        f"WHERE node_id IN ({placeholders})"
+                        f"SELECT {self._build_get_nodes_select()} FROM `{self.table_name}` "
+                        f"WHERE `{self._node_id_column}` IN ({placeholders})"
                     )
                     result = session.execute(stmt, params)
                     for item in result:
-                        meta = self._parse_metadata(item[1])
-                        node = metadata_dict_to_node(meta)
-                        node.set_content(str(item[0]))
+                        meta = self._record_to_metadata(item)
+                        node = self._reconstruct_node(
+                            meta, str(item[1]), item[0]
+                        )
                         nodes.append(node)
         elif filters:
             global_param_counter = [0]
@@ -1978,19 +2462,20 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 filters, global_param_counter
             )
             stmt = sqlalchemy.text(
-                f"SELECT text, metadata FROM `{self.table_name}` "
+                f"SELECT {self._build_get_nodes_select()} FROM `{self.table_name}` "
                 f"WHERE {where_clause}"
             )
             with self._session() as session:
                 result = session.execute(stmt, filter_params)
                 for item in result:
-                    meta = self._parse_metadata(item[1])
-                    node = metadata_dict_to_node(meta)
-                    node.set_content(str(item[0]))
+                    meta = self._record_to_metadata(item)
+                    node = self._reconstruct_node(
+                        meta, str(item[1]), item[0]
+                    )
                     nodes.append(node)
         else:
             stmt = sqlalchemy.text(
-                f"SELECT text, metadata FROM `{self.table_name}` "
+                f"SELECT {self._build_get_nodes_select()} FROM `{self.table_name}` "
                 f"LIMIT 10000"
             )
             _logger.warning(
@@ -2000,9 +2485,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             with self._session() as session:
                 result = session.execute(stmt)
                 for item in result:
-                    meta = self._parse_metadata(item[1])
-                    node = metadata_dict_to_node(meta)
-                    node.set_content(str(item[0]))
+                    meta = self._record_to_metadata(item)
+                    node = self._reconstruct_node(
+                        meta, str(item[1]), item[0]
+                    )
                     nodes.append(node)
 
         return nodes
@@ -2031,14 +2517,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                         for i, nid in enumerate(chunk)
                     }
                     stmt = sqlalchemy.text(
-                        f"SELECT text, metadata FROM `{self.table_name}` "
-                        f"WHERE node_id IN ({placeholders})"
+                        f"SELECT {self._build_get_nodes_select()} FROM `{self.table_name}` "
+                        f"WHERE `{self._node_id_column}` IN ({placeholders})"
                     )
                     result = await session.execute(stmt, params)
                     for item in result:
-                        meta = self._parse_metadata(item[1])
-                        node = metadata_dict_to_node(meta)
-                        node.set_content(str(item[0]))
+                        meta = self._record_to_metadata(item)
+                        node = self._reconstruct_node(
+                            meta, str(item[1]), item[0]
+                        )
                         nodes.append(node)
         elif filters:
             global_param_counter = [0]
@@ -2046,19 +2533,20 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 filters, global_param_counter
             )
             stmt = sqlalchemy.text(
-                f"SELECT text, metadata FROM `{self.table_name}` "
+                f"SELECT {self._build_get_nodes_select()} FROM `{self.table_name}` "
                 f"WHERE {where_clause}"
             )
             async with self._async_session() as session:
                 result = await session.execute(stmt, filter_params)
                 for item in result:
-                    meta = self._parse_metadata(item[1])
-                    node = metadata_dict_to_node(meta)
-                    node.set_content(str(item[0]))
+                    meta = self._record_to_metadata(item)
+                    node = self._reconstruct_node(
+                        meta, str(item[1]), item[0]
+                    )
                     nodes.append(node)
         else:
             stmt = sqlalchemy.text(
-                f"SELECT text, metadata FROM `{self.table_name}` "
+                f"SELECT {self._build_get_nodes_select()} FROM `{self.table_name}` "
                 f"LIMIT 10000"
             )
             _logger.warning(
@@ -2068,9 +2556,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             async with self._async_session() as session:
                 result = await session.execute(stmt)
                 for item in result:
-                    meta = self._parse_metadata(item[1])
-                    node = metadata_dict_to_node(meta)
-                    node.set_content(str(item[0]))
+                    meta = self._record_to_metadata(item)
+                    node = self._reconstruct_node(
+                        meta, str(item[1]), item[0]
+                    )
                     nodes.append(node)
 
         return nodes
@@ -2083,10 +2572,19 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Delete nodes by ref_doc_id (stored in metadata)."""
         self._initialize()
 
+        if self._metadata_json_column is None:
+            raise ValueError(
+                "delete(ref_doc_id) requires a JSON metadata column to "
+                "store the 'ref_doc_id' key. When metadata_json_column=None, "
+                "use delete_nodes(filters=...) or delete_by_metadata(filters=...) "
+                "instead, or add 'ref_doc_id' to metadata_columns to filter "
+                "on a dedicated column."
+            )
+
         with self._session() as session:
             stmt = sqlalchemy.text(
                 f"DELETE FROM `{self.table_name}` "
-                f"WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.ref_doc_id')) "
+                f"WHERE JSON_UNQUOTE(JSON_EXTRACT(`{self._metadata_json_column}`, '$.ref_doc_id')) "
                 f"= :doc_id"
             )
             session.execute(stmt, {"doc_id": ref_doc_id})
@@ -2096,10 +2594,19 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Async delete nodes by ref_doc_id."""
         self._initialize()
 
+        if self._metadata_json_column is None:
+            raise ValueError(
+                "adelete(ref_doc_id) requires a JSON metadata column to "
+                "store the 'ref_doc_id' key. When metadata_json_column=None, "
+                "use adelete_nodes(filters=...) or adelete_by_metadata(filters=...) "
+                "instead, or add 'ref_doc_id' to metadata_columns to filter "
+                "on a dedicated column."
+            )
+
         async with self._async_session() as session:
             stmt = sqlalchemy.text(
                 f"DELETE FROM `{self.table_name}` "
-                f"WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata, '$.ref_doc_id')) "
+                f"WHERE JSON_UNQUOTE(JSON_EXTRACT(`{self._metadata_json_column}`, '$.ref_doc_id')) "
                 f"= :doc_id"
             )
             await session.execute(stmt, {"doc_id": ref_doc_id})
@@ -2128,7 +2635,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     }
                     stmt = sqlalchemy.text(
                         f"DELETE FROM `{self.table_name}` "
-                        f"WHERE node_id IN ({placeholders})"
+                        f"WHERE `{self._node_id_column}` IN ({placeholders})"
                     )
                     session.execute(stmt, params)
                 session.commit()
@@ -2167,7 +2674,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     }
                     stmt = sqlalchemy.text(
                         f"DELETE FROM `{self.table_name}` "
-                        f"WHERE node_id IN ({placeholders})"
+                        f"WHERE `{self._node_id_column}` IN ({placeholders})"
                     )
                     await session.execute(stmt, params)
                 await session.commit()
@@ -2220,7 +2727,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         )
 
         stmt = sqlalchemy.text(
-            f"SELECT node_id, text, metadata "
+            f"SELECT {self._build_get_nodes_select()} "
             f"FROM `{self.table_name}` "
             f"WHERE {where_clause} LIMIT :limit"
         )
@@ -2230,10 +2737,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             result = session.execute(stmt, filter_params)
             nodes: List[BaseNode] = []
             for row in result:
-                meta = self._parse_metadata(row[2])
-                node = metadata_dict_to_node(meta or {})
-                node.set_content(str(row[1]))
-                node.node_id = str(row[0])
+                meta = self._record_to_metadata(row)
+                node = self._reconstruct_node(
+                    meta or {}, str(row[1]), str(row[0])
+                )
                 nodes.append(node)
         return nodes
 
@@ -2266,7 +2773,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         )
 
         stmt = sqlalchemy.text(
-            f"SELECT node_id, text, metadata "
+            f"SELECT {self._build_get_nodes_select()} "
             f"FROM `{self.table_name}` "
             f"WHERE {where_clause} LIMIT :limit"
         )
@@ -2276,10 +2783,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             result = await session.execute(stmt, filter_params)
             nodes: List[BaseNode] = []
             for row in result:
-                meta = self._parse_metadata(row[2])
-                node = metadata_dict_to_node(meta or {})
-                node.set_content(str(row[1]))
-                node.node_id = str(row[0])
+                meta = self._record_to_metadata(row)
+                node = self._reconstruct_node(
+                    meta or {}, str(row[1]), str(row[0])
+                )
                 nodes.append(node)
         return nodes
 
