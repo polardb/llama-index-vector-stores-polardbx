@@ -474,7 +474,7 @@ class TestEndToEndUserSimulation:
             database=DB_NAME,
             table_name=table,
             embed_dim=EMBED_DIM,
-            distance_method="COSINE",
+            distance_strategy="cosine",
             connection_retries=3,
             retry_delay=0.5,
             connect_timeout=10,

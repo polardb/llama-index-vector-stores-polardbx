@@ -495,7 +495,7 @@ def create_partitioned_table(
 
                         raise NotSupportedError(
                             "PolarDB-X does not support partitioning on this "
-                            "instance. This may occur on certain v3 DN "
+                            "instance. This may occur on certain DN "
                             "versions. Try upgrading the DN version, or "
                             "remove partition parameters to create a "
                             "non-partitioned table."

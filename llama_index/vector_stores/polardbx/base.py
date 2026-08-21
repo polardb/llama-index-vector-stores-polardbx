@@ -78,7 +78,7 @@ _OWN_PARAMS: set = {
     "table_name",
     "embed_dim",
     "default_m",
-    "distance_method",
+    "distance_strategy",
     "perform_setup",
     "debug",
     "ef_construction",
@@ -147,7 +147,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 database="your-database",
                 table_name="my_vectors",
                 embed_dim=1536,
-                distance_method="COSINE",
+                distance_strategy="cosine",
             )
     """
 
@@ -164,7 +164,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     database: str
     embed_dim: int = 1536
     default_m: int = 6
-    distance_method: Literal["EUCLIDEAN", "COSINE", "INNER_PRODUCT"] = "COSINE"
+    distance_strategy: Literal["euclidean", "cosine", "inner_product"] = "cosine"
     perform_setup: bool = True
     debug: bool = False
 
@@ -222,7 +222,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     @staticmethod
     def _validate_positive_int(value: int, param_name: str) -> int:
         """Validate that a value is a positive integer."""
-        if not isinstance(value, int) or value <= 0:
+        # L4: Reject booleans — isinstance(True, int) is True in Python
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
             raise ValueError(
                 f"Expected positive int for {param_name}, got {value}"
             )
@@ -283,7 +284,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         table_name: str = "llama_index_table",
         embed_dim: int = 1536,
         default_m: int = 6,
-        distance_method: Literal["EUCLIDEAN", "COSINE", "INNER_PRODUCT"] = "COSINE",
+        distance_strategy: Literal["euclidean", "cosine", "inner_product"] = "cosine",
         perform_setup: bool = True,
         debug: bool = False,
         ef_construction: Optional[int] = None,
@@ -318,14 +319,14 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 Defaults to ``"llama_index_table"``.
             embed_dim: Embedding dimension. Defaults to 1536.
             default_m: HNSW index M parameter (3-200). Defaults to 6.
-            distance_method: Distance function — ``"COSINE"``,
-                ``"EUCLIDEAN"``, or ``"INNER_PRODUCT"`` (v3 only).
-                Defaults to ``"COSINE"``.
+            distance_strategy: Distance function — ``"cosine"``,
+                ``"euclidean"``, or ``"inner_product"`` (newer versions only).
+                Defaults to ``"cosine"``.
             perform_setup: If True, auto-create table on init.
                 Defaults to True.
             debug: Enable SQLAlchemy echo mode. Defaults to False.
             ef_construction: HNSW build-time candidate list size
-                (5-1000, v3 only). Ignored on old versions.
+                (5-1000, newer versions only). Ignored on older versions.
                 Defaults to None (use DN default of 10).
             vector_index_name: Name of the vector index for FORCE INDEX
                 hints. If None, auto-detected on first use.
@@ -398,10 +399,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 f"retry_delay must be a non-negative number, got {retry_delay}"
             )
 
-        if distance_method not in ("EUCLIDEAN", "COSINE", "INNER_PRODUCT"):
+        if distance_strategy not in ("euclidean", "cosine", "inner_product"):
             raise ValueError(
-                f"Invalid distance_method: {distance_method}. "
-                "Must be 'COSINE', 'EUCLIDEAN', or 'INNER_PRODUCT'."
+                f"Invalid distance_strategy: {distance_strategy}. "
+                "Must be 'cosine', 'euclidean', or 'inner_product'."
             )
 
         # Validate partition params
@@ -519,7 +520,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             database=database,
             embed_dim=embed_dim,
             default_m=default_m,
-            distance_method=distance_method,
+            distance_strategy=distance_strategy,
             perform_setup=perform_setup,
             debug=debug,
         )
@@ -575,7 +576,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         table_name: str = "llama_index_table",
         embed_dim: int = 1536,
         default_m: int = 6,
-        distance_method: Literal["EUCLIDEAN", "COSINE", "INNER_PRODUCT"] = "COSINE",
+        distance_strategy: Literal["euclidean", "cosine", "inner_product"] = "cosine",
         perform_setup: bool = True,
         debug: bool = False,
         ef_construction: Optional[int] = None,
@@ -608,7 +609,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             table_name=table_name,
             embed_dim=embed_dim,
             default_m=default_m,
-            distance_method=distance_method,
+            distance_strategy=distance_strategy,
             perform_setup=perform_setup,
             debug=debug,
             ef_construction=ef_construction,
@@ -728,7 +729,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                             # features work even when
                             # perform_setup=False.
                             self._detect_capabilities()
-                            self._validate_distance_method()
+                            self._validate_distance_strategy()
                             if self.perform_setup:
                                 self._create_table_if_not_exists()
                             self._is_initialized = True
@@ -907,15 +908,16 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             # Other errors mean the procedure exists but rejected the args
             return True
 
-    def _validate_distance_method(self) -> None:
-        """Validate INNER_PRODUCT requires v3 support."""
+    def _validate_distance_strategy(self) -> None:
+        """Validate INNER_PRODUCT requires newer version support."""
         if (
-            self.distance_method == "INNER_PRODUCT"
+            self.distance_strategy == "inner_product"
             and not self._capabilities.get("vec_dim", False)
         ):
             raise NotSupportedError(
-                "distance_method='INNER_PRODUCT' requires PolarDB-X v3. "
-                "Use 'COSINE' or 'EUCLIDEAN' for old versions."
+                "distance_strategy='inner_product' requires a newer "
+                "PolarDB-X version. Use 'cosine' or 'euclidean' for "
+                "older versions."
             )
 
     def _probe_vec_distance(self) -> bool:
@@ -948,10 +950,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 or "ER_VEC_DISTANCE" in err_msg
             ):
                 _logger.debug(
-                    "VEC_DISTANCE exists but needs index context: %s", e
+                    "VEC_DISTANCE exists but needs index context: %s",
+                    self._sanitize_error(e),
                 )
                 return True
-            _logger.debug("VEC_DISTANCE probe failed: %s", e)
+            _logger.debug(
+                "VEC_DISTANCE probe failed: %s", self._sanitize_error(e)
+            )
             return False
 
     def _probe_function(self, sql: str) -> bool:
@@ -963,7 +968,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 result = session.execute(text(sql))
                 return result.fetchone() is not None
         except Exception as e:
-            _logger.debug("Function probe failed [%s]: %s", sql, e)
+            _logger.debug(
+                "Function probe failed [%s]: %s",
+                sql, self._sanitize_error(e),
+            )
             return False
 
     def _probe_table_exists(self, schema: str, table: str) -> bool:
@@ -983,22 +991,23 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 return row[0] > 0 if row else False
         except Exception as e:
             _logger.debug(
-                "Table probe failed [%s.%s]: %s", schema, table, e
+                "Table probe failed [%s.%s]: %s",
+                schema, table, self._sanitize_error(e),
             )
             return False
 
     def _get_distance_func(self) -> str:
         """Return the optimal distance function for the current instance.
 
-        Prefers VEC_DISTANCE (auto-inference, v3) when available;
+        Prefers VEC_DISTANCE (auto-inference, newer versions) when available;
         falls back to explicit VEC_DISTANCE_COSINE / _EUCLIDEAN /
         _INNER_PRODUCT otherwise.
         """
         if self._capabilities.get("vec_distance", False):
             return "VEC_DISTANCE"
-        if self.distance_method == "COSINE":
+        if self.distance_strategy == "cosine":
             return "VEC_DISTANCE_COSINE"
-        if self.distance_method == "INNER_PRODUCT":
+        if self.distance_strategy == "inner_product":
             return "VEC_DISTANCE_INNER_PRODUCT"
         return "VEC_DISTANCE_EUCLIDEAN"
 
@@ -1076,7 +1085,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 metadata JSON,
                 embedding VECTOR({self.embed_dim}) NOT NULL,
                 {node_index_type} `node_id_index` (node_id),
-                VECTOR INDEX `vi` (embedding) M={self.default_m}{ef_clause} DISTANCE={self.distance_method}
+                VECTOR INDEX `vi` (embedding) M={self.default_m}{ef_clause} DISTANCE={self.distance_strategy.upper()}
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
             """
 
@@ -1096,7 +1105,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                         raise NotSupportedError(
                             "PolarDB-X vector index on partitioned tables is "
                             "not supported on this instance. This may occur "
-                            "on older v3 DN versions. Try upgrading the DN "
+                            "on older DN versions. Try upgrading the DN "
                             "version, or remove partition parameters "
                             "(partition_by, broadcast, etc.) to create a "
                             "non-partitioned vector table."
@@ -1153,7 +1162,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         lines.append(
             f"    VECTOR INDEX `vi` ({self._embedding_column}) "
             f"M={self.default_m}{index_extra} "
-            f"DISTANCE={self.distance_method}"
+            f"DISTANCE={self.distance_strategy.upper()}"
         )
         # Add metadata columns: use Column objects when available
         # (for new tables), fall back to TEXT for string-only names
@@ -1446,7 +1455,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Validate that all node embeddings match the expected dimension.
 
         Checks each node's embedding length against ``self.embed_dim``.
-        On v3 instances, additionally cross-checks with DN's
+        On newer versions, additionally cross-checks with DN's
         ``VECTOR_DIM`` to catch client/server dimension mismatches.
 
         Args:
@@ -1491,7 +1500,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 raise
             except Exception as e:
                 _logger.debug(
-                    "VECTOR_DIM cross-check failed: %s", e
+                    "VECTOR_DIM cross-check failed: %s",
+                    self._sanitize_error(e),
                 )
 
     # ------------------------------------------------------------------
@@ -1554,6 +1564,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 f"List values are only supported for IN and "
                 f"NIN operators."
             )
+        elif filter_.value is None:
+            # L2: None values require IS NULL / IS NOT NULL
+            if filter_.operator not in (FilterOperator.EQ, FilterOperator.NE):
+                raise ValueError(
+                    f"Filter '{filter_.key}' uses operator "
+                    f"{filter_.operator} with None value. "
+                    f"Only EQ and NE support None values."
+                )
+            filter_value = None
         else:
             param_name = f"param_{global_param_counter[0]}"
             global_param_counter[0] += 1
@@ -1588,7 +1607,14 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 f"'$.{filter_.key}'))"
             )
 
-        clause = f"{lhs} {self._to_mysql_operator(filter_.operator)} {filter_value}"
+        if filter_value is None:
+            # L2: None value — use IS NULL / IS NOT NULL
+            if filter_.operator == FilterOperator.EQ:
+                clause = f"{lhs} IS NULL"
+            else:
+                clause = f"{lhs} IS NOT NULL"
+        else:
+            clause = f"{lhs} {self._to_mysql_operator(filter_.operator)} {filter_value}"
         return clause, params
 
     def _filters_to_where_clause(
@@ -1668,7 +1694,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     if not k.startswith("_")
                 },
             )
-        node.set_content(str(text))
+        node.set_content(text if text is not None else "")
         if node_id is not None:
             node.node_id = str(node_id)
         return node
@@ -1703,16 +1729,16 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     def _distance_to_similarity(self, distance: float) -> float:
         """Convert a raw distance value to a similarity score.
 
-        The conversion depends on ``distance_method``:
+        The conversion depends on ``distance_strategy``:
         - COSINE: ``1 - distance``  (range [-1, 1])
         - EUCLIDEAN: ``1 / (1 + distance)``  (range (0, 1])
         - INNER_PRODUCT: ``-distance``  (distance is -dot_product)
         """
-        if self.distance_method == "COSINE":
+        if self.distance_strategy == "cosine":
             return 1.0 - distance
-        elif self.distance_method == "EUCLIDEAN":
+        elif self.distance_strategy == "euclidean":
             return 1.0 / (1.0 + max(0.0, distance))
-        elif self.distance_method == "INNER_PRODUCT":
+        elif self.distance_strategy == "inner_product":
             return -distance
         return 1.0 - distance
 
@@ -1850,7 +1876,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     ) -> Dict[str, List[float]]:
         """Fetch stored embedding vectors by node_id.
 
-        Uses ``VEC_TOTEXT`` on v3 instances, ``CAST(embedding AS CHAR)``
+        Uses ``VEC_TOTEXT`` on newer versions, ``CAST(embedding AS CHAR)``
         on old versions.
 
         Args:
@@ -1981,10 +2007,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     )
                     row = result.fetchone()
                     if row and row[0]:
-                        self._vector_index_name = row[0]
+                        self._vector_index_name = self._validate_identifier(row[0])
                         return self._vector_index_name
             except Exception as e:
-                _logger.debug("VECTOR_INDEXES query failed: %s", e)
+                _logger.debug(
+                    "VECTOR_INDEXES query failed: %s",
+                    self._sanitize_error(e),
+                )
 
         # Fallback: parse SHOW CREATE TABLE with regex
         try:
@@ -2000,10 +2029,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                         re.IGNORECASE
                     )
                     if m:
-                        self._vector_index_name = m.group(1)
+                        self._vector_index_name = self._validate_identifier(m.group(1))
                         return self._vector_index_name
         except Exception as e:
-            _logger.debug("Failed to detect vector index name: %s", e)
+            _logger.debug(
+                "Failed to detect vector index name: %s",
+                self._sanitize_error(e),
+            )
         self._vector_index_checked = True
         return None
 
@@ -2241,7 +2273,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             where_clause, filter_params = self._filters_to_where_clause(
                 query.filters, global_param_counter
             )
-            where_clause = f"WHERE {where_clause}"
+            where_clause = f"WHERE {where_clause}" if where_clause else ""
             params.update(filter_params)
 
         stmt = sqlalchemy.text(
@@ -2358,7 +2390,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             where_clause, filter_params = self._filters_to_where_clause(
                 query.filters, global_param_counter
             )
-            where_clause = f"WHERE {where_clause}"
+            where_clause = f"WHERE {where_clause}" if where_clause else ""
             params.update(filter_params)
 
         stmt = sqlalchemy.text(
@@ -2453,24 +2485,28 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     for item in result:
                         meta = self._record_to_metadata(item)
                         node = self._reconstruct_node(
-                            meta, str(item[1]), item[0]
+                            meta, item[1] if item[1] is not None else "", item[0]
                         )
                         nodes.append(node)
-        elif filters:
+        elif filters and filters.filters:
             global_param_counter = [0]
             where_clause, filter_params = self._filters_to_where_clause(
                 filters, global_param_counter
             )
             stmt = sqlalchemy.text(
                 f"SELECT {self._build_get_nodes_select()} FROM `{self.table_name}` "
-                f"WHERE {where_clause}"
+                f"WHERE {where_clause} LIMIT 10000"
+            )
+            _logger.warning(
+                "get_nodes(filters=...) results capped "
+                "at 10000 rows."
             )
             with self._session() as session:
                 result = session.execute(stmt, filter_params)
                 for item in result:
                     meta = self._record_to_metadata(item)
                     node = self._reconstruct_node(
-                        meta, str(item[1]), item[0]
+                        meta, item[1] if item[1] is not None else "", item[0]
                     )
                     nodes.append(node)
         else:
@@ -2487,7 +2523,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 for item in result:
                     meta = self._record_to_metadata(item)
                     node = self._reconstruct_node(
-                        meta, str(item[1]), item[0]
+                        meta, item[1] if item[1] is not None else "", item[0]
                     )
                     nodes.append(node)
 
@@ -2524,24 +2560,28 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     for item in result:
                         meta = self._record_to_metadata(item)
                         node = self._reconstruct_node(
-                            meta, str(item[1]), item[0]
+                            meta, item[1] if item[1] is not None else "", item[0]
                         )
                         nodes.append(node)
-        elif filters:
+        elif filters and filters.filters:
             global_param_counter = [0]
             where_clause, filter_params = self._filters_to_where_clause(
                 filters, global_param_counter
             )
             stmt = sqlalchemy.text(
                 f"SELECT {self._build_get_nodes_select()} FROM `{self.table_name}` "
-                f"WHERE {where_clause}"
+                f"WHERE {where_clause} LIMIT 10000"
+            )
+            _logger.warning(
+                "get_nodes(filters=...) results capped "
+                "at 10000 rows."
             )
             async with self._async_session() as session:
                 result = await session.execute(stmt, filter_params)
                 for item in result:
                     meta = self._record_to_metadata(item)
                     node = self._reconstruct_node(
-                        meta, str(item[1]), item[0]
+                        meta, item[1] if item[1] is not None else "", item[0]
                     )
                     nodes.append(node)
         else:
@@ -2558,7 +2598,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 for item in result:
                     meta = self._record_to_metadata(item)
                     node = self._reconstruct_node(
-                        meta, str(item[1]), item[0]
+                        meta, item[1] if item[1] is not None else "", item[0]
                     )
                     nodes.append(node)
 
@@ -2572,10 +2612,19 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Delete nodes by ref_doc_id (stored in metadata)."""
         self._initialize()
 
-        if self._metadata_json_column is None:
+        # S2: Use direct column reference when ref_doc_id is mapped
+        if "ref_doc_id" in self._metadata_column_names:
+            where_clause = f"`ref_doc_id` = :doc_id"
+        elif self._metadata_json_column is not None:
+            where_clause = (
+                f"JSON_UNQUOTE(JSON_EXTRACT("
+                f"`{self._metadata_json_column}`, "
+                f"'$.ref_doc_id')) = :doc_id"
+            )
+        else:
             raise ValueError(
-                "delete(ref_doc_id) requires a JSON metadata column to "
-                "store the 'ref_doc_id' key. When metadata_json_column=None, "
+                "delete(ref_doc_id) requires a JSON metadata column or "
+                "a 'ref_doc_id' mapped column. When metadata_json_column=None, "
                 "use delete_nodes(filters=...) or delete_by_metadata(filters=...) "
                 "instead, or add 'ref_doc_id' to metadata_columns to filter "
                 "on a dedicated column."
@@ -2584,8 +2633,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         with self._session() as session:
             stmt = sqlalchemy.text(
                 f"DELETE FROM `{self.table_name}` "
-                f"WHERE JSON_UNQUOTE(JSON_EXTRACT(`{self._metadata_json_column}`, '$.ref_doc_id')) "
-                f"= :doc_id"
+                f"WHERE {where_clause}"
             )
             session.execute(stmt, {"doc_id": ref_doc_id})
             session.commit()
@@ -2594,10 +2642,19 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         """Async delete nodes by ref_doc_id."""
         self._initialize()
 
-        if self._metadata_json_column is None:
+        # S2: Use direct column reference when ref_doc_id is mapped
+        if "ref_doc_id" in self._metadata_column_names:
+            where_clause = f"`ref_doc_id` = :doc_id"
+        elif self._metadata_json_column is not None:
+            where_clause = (
+                f"JSON_UNQUOTE(JSON_EXTRACT("
+                f"`{self._metadata_json_column}`, "
+                f"'$.ref_doc_id')) = :doc_id"
+            )
+        else:
             raise ValueError(
-                "adelete(ref_doc_id) requires a JSON metadata column to "
-                "store the 'ref_doc_id' key. When metadata_json_column=None, "
+                "adelete(ref_doc_id) requires a JSON metadata column or "
+                "a 'ref_doc_id' mapped column. When metadata_json_column=None, "
                 "use adelete_nodes(filters=...) or adelete_by_metadata(filters=...) "
                 "instead, or add 'ref_doc_id' to metadata_columns to filter "
                 "on a dedicated column."
@@ -2606,8 +2663,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         async with self._async_session() as session:
             stmt = sqlalchemy.text(
                 f"DELETE FROM `{self.table_name}` "
-                f"WHERE JSON_UNQUOTE(JSON_EXTRACT(`{self._metadata_json_column}`, '$.ref_doc_id')) "
-                f"= :doc_id"
+                f"WHERE {where_clause}"
             )
             await session.execute(stmt, {"doc_id": ref_doc_id})
             await session.commit()
@@ -2639,7 +2695,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     )
                     session.execute(stmt, params)
                 session.commit()
-            elif filters:
+            elif filters and filters.filters:
                 global_param_counter = [0]
                 where_clause, filter_params = self._filters_to_where_clause(
                     filters, global_param_counter
@@ -2650,6 +2706,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 )
                 session.execute(stmt, filter_params)
                 session.commit()
+            else:
+                _logger.warning(
+                    "delete_nodes() called without node_ids or "
+                    "filters; no rows deleted."
+                )
 
     async def adelete_nodes(
         self,
@@ -2678,7 +2739,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                     )
                     await session.execute(stmt, params)
                 await session.commit()
-            elif filters:
+            elif filters and filters.filters:
                 global_param_counter = [0]
                 where_clause, filter_params = self._filters_to_where_clause(
                     filters, global_param_counter
@@ -2689,6 +2750,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 )
                 await session.execute(stmt, filter_params)
                 await session.commit()
+            else:
+                _logger.warning(
+                    "adelete_nodes() called without node_ids or "
+                    "filters; no rows deleted."
+                )
 
     # ------------------------------------------------------------------
     # Metadata-only search and delete (no vector similarity)
@@ -2721,6 +2787,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 f"limit must be a positive integer, got {limit}"
             )
 
+        if not filters.filters:
+            raise ValueError(
+                "filters cannot be empty — provide at least one "
+                "MetadataFilter condition."
+            )
+
         global_param_counter = [0]
         where_clause, filter_params = self._filters_to_where_clause(
             filters, global_param_counter
@@ -2739,7 +2811,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             for row in result:
                 meta = self._record_to_metadata(row)
                 node = self._reconstruct_node(
-                    meta or {}, str(row[1]), str(row[0])
+                    meta or {}, row[1] if row[1] is not None else "", str(row[0])
                 )
                 nodes.append(node)
         return nodes
@@ -2767,6 +2839,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 f"limit must be a positive integer, got {limit}"
             )
 
+        if not filters.filters:
+            raise ValueError(
+                "filters cannot be empty — provide at least one "
+                "MetadataFilter condition."
+            )
+
         global_param_counter = [0]
         where_clause, filter_params = self._filters_to_where_clause(
             filters, global_param_counter
@@ -2785,7 +2863,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             for row in result:
                 meta = self._record_to_metadata(row)
                 node = self._reconstruct_node(
-                    meta or {}, str(row[1]), str(row[0])
+                    meta or {}, row[1] if row[1] is not None else "", str(row[0])
                 )
                 nodes.append(node)
         return nodes
@@ -2801,6 +2879,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             Number of deleted rows.
         """
         self._initialize()
+
+        if not filters.filters:
+            raise ValueError(
+                "filters cannot be empty — provide at least one "
+                "MetadataFilter condition."
+            )
 
         global_param_counter = [0]
         where_clause, filter_params = self._filters_to_where_clause(
@@ -2831,6 +2915,12 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             Number of deleted rows.
         """
         self._initialize()
+
+        if not filters.filters:
+            raise ValueError(
+                "filters cannot be empty — provide at least one "
+                "MetadataFilter condition."
+            )
 
         global_param_counter = [0]
         where_clause, filter_params = self._filters_to_where_clause(
@@ -2959,6 +3049,13 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                         loop.close()
                         asyncio.set_event_loop(None)
         self._is_initialized = False
+        # L7: Reset engine/session references for consistency with
+        # _cleanup_engines(), so that any stale access raises clearly
+        # instead of using a disposed engine.
+        self._engine = None
+        self._async_engine = None
+        self._session = None
+        self._async_session = None
 
     async def aclose(self) -> None:
         """Async close engines."""
@@ -2969,6 +3066,10 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         if self._async_engine:
             await self._async_engine.dispose()
         self._is_initialized = False
+        self._engine = None
+        self._async_engine = None
+        self._session = None
+        self._async_session = None
 
     # ------------------------------------------------------------------
     # Phase 2: Dynamic vector index management
@@ -2986,11 +3087,11 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         Args:
             index_name: Name for the vector index. Defaults to ``"vi"``.
             m: HNSW M parameter (3-200). Defaults to the store's default_m.
-            distance: Distance function (``"COSINE"``, ``"EUCLIDEAN"``,
-                or ``"INNER_PRODUCT"``). Defaults to the store's method.
-                ``INNER_PRODUCT`` requires v3.
+            distance: Distance function (``"cosine"``, ``"euclidean"``,
+                or ``"inner_product"``). Defaults to the store's strategy.
+                ``inner_product`` requires a newer PolarDB-X version.
             ef_construction: HNSW build-time candidate list size (5-1000).
-                v3 only; silently ignored on old versions.
+                Newer versions only; silently ignored on older versions.
         """
         self._initialize()
         self._validate_identifier(index_name)
@@ -2999,19 +3100,20 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         self._validate_positive_int(m_val, "m")
         if not (3 <= m_val <= 200):
             raise ValueError(f"m must be 3-200, got {m_val}")
-        dist_val = (distance or self.distance_method).upper()
+        dist_val = (distance or self.distance_strategy).upper()
         if dist_val not in ("COSINE", "EUCLIDEAN", "INNER_PRODUCT"):
             raise ValueError(
                 f"Invalid distance function: {dist_val}. "
-                "Must be 'COSINE', 'EUCLIDEAN', or 'INNER_PRODUCT'."
+                "Must be 'cosine', 'euclidean', or 'inner_product'."
             )
         if (
             dist_val == "INNER_PRODUCT"
             and not self._capabilities.get("vec_dim", False)
         ):
             raise NotSupportedError(
-                "distance='INNER_PRODUCT' requires PolarDB-X v3. "
-                "Use 'COSINE' or 'EUCLIDEAN' for old versions."
+                "distance='inner_product' requires a newer "
+                "PolarDB-X version. Use 'cosine' or 'euclidean' for "
+                "older versions."
             )
         ef_val = ef_construction or self._ef_construction
         if ef_val is not None:
@@ -3028,7 +3130,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             session.execute(
                 sqlalchemy.text(
                     f"ALTER TABLE `{self.table_name}` "
-                    f"ADD VECTOR INDEX `{index_name}` (embedding) "
+                    f"ADD VECTOR INDEX `{index_name}` (`{self._embedding_column}`) "
                     f"M={m_val}{ef_clause} DISTANCE={dist_val}"
                 )
             )
@@ -3055,19 +3157,20 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         self._validate_positive_int(m_val, "m")
         if not (3 <= m_val <= 200):
             raise ValueError(f"m must be 3-200, got {m_val}")
-        dist_val = (distance or self.distance_method).upper()
+        dist_val = (distance or self.distance_strategy).upper()
         if dist_val not in ("COSINE", "EUCLIDEAN", "INNER_PRODUCT"):
             raise ValueError(
                 f"Invalid distance function: {dist_val}. "
-                "Must be 'COSINE', 'EUCLIDEAN', or 'INNER_PRODUCT'."
+                "Must be 'cosine', 'euclidean', or 'inner_product'."
             )
         if (
             dist_val == "INNER_PRODUCT"
             and not self._capabilities.get("vec_dim", False)
         ):
             raise NotSupportedError(
-                "distance='INNER_PRODUCT' requires PolarDB-X v3. "
-                "Use 'COSINE' or 'EUCLIDEAN' for old versions."
+                "distance='inner_product' requires a newer "
+                "PolarDB-X version. Use 'cosine' or 'euclidean' for "
+                "older versions."
             )
         ef_val = ef_construction or self._ef_construction
         if ef_val is not None:
@@ -3084,7 +3187,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             await session.execute(
                 sqlalchemy.text(
                     f"ALTER TABLE `{self.table_name}` "
-                    f"ADD VECTOR INDEX `{index_name}` (embedding) "
+                    f"ADD VECTOR INDEX `{index_name}` (`{self._embedding_column}`) "
                     f"M={m_val}{ef_clause} DISTANCE={dist_val}"
                 )
             )
@@ -3201,20 +3304,20 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
     # ------------------------------------------------------------------
 
     def _require_v3(self, feature: str) -> None:
-        """Raise NotSupportedError if v3 capabilities are not available.
+        """Raise NotSupportedError if newer version capabilities are not available.
 
-        Uses ``vec_dim`` (VECTOR_DIM) as the v3 indicator — present iff
-        the instance has v3 vector features enabled.
+        Uses ``vec_dim`` (VECTOR_DIM) as the newer version indicator —
+        present iff the instance has newer vector features enabled.
         """
         if not self._capabilities.get("vec_dim", False):
             raise NotSupportedError(
-                f"{feature} requires PolarDB-X v3 with vector index "
-                "support. Current instance does not support v3 vector "
-                "features."
+                f"{feature} requires a newer PolarDB-X version with "
+                "vector index support. Current instance does not support "
+                "these vector features."
             )
 
     def preload_index(self) -> None:
-        """Preload the HNSW vector index into memory cache (v3 only).
+        """Preload the HNSW vector index into memory cache (newer versions only).
 
         Loads the entire HNSW auxiliary table graph into the shared
         cache to eliminate cold-start latency on the first query.
@@ -3235,7 +3338,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             result = session.execute(
                 sqlalchemy.text(
                     f"CALL dbms_vidx.preload("
-                    f"'{self.database}', '{self.table_name}', 'embedding')"
+                    f"'{self.database}', '{self.table_name}', '{self._embedding_column}')"
                 )
             )
             result.fetchall()
@@ -3245,7 +3348,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         )
 
     async def apreload_index(self) -> None:
-        """Async preload the HNSW vector index (v3 only)."""
+        """Async preload the HNSW vector index (newer versions only)."""
         self._initialize()
         self._require_v3("preload_index()")
         if not self._capabilities.get("dbms_vidx", False):
@@ -3262,7 +3365,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             result = await session.execute(
                 sqlalchemy.text(
                     f"CALL dbms_vidx.preload("
-                    f"'{self.database}', '{self.table_name}', 'embedding')"
+                    f"'{self.database}', '{self.table_name}', '{self._embedding_column}')"
                 )
             )
             result.fetchall()
@@ -3272,7 +3375,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         )
 
     def preload_check(self) -> Dict[str, Any]:
-        """Check if preloading would fit in cache (v3 only).
+        """Check if preloading would fit in cache (newer versions only).
 
         Returns:
             Dictionary with check results (rows, memory estimate, etc.).
@@ -3293,7 +3396,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             result = session.execute(
                 sqlalchemy.text(
                     f"CALL dbms_vidx.preload_check("
-                    f"'{self.database}', '{self.table_name}', 'embedding')"
+                    f"'{self.database}', '{self.table_name}', '{self._embedding_column}')"
                 )
             )
             rows = result.fetchall()
@@ -3303,7 +3406,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         return {str(idx): dict(row._mapping) for idx, row in enumerate(rows)}
 
     async def apreload_check(self) -> Dict[str, Any]:
-        """Async check if preloading would fit in cache (v3 only)."""
+        """Async check if preloading would fit in cache (newer versions only)."""
         self._initialize()
         self._require_v3("preload_check()")
         if not self._capabilities.get("dbms_vidx", False):
@@ -3320,7 +3423,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             result = await session.execute(
                 sqlalchemy.text(
                     f"CALL dbms_vidx.preload_check("
-                    f"'{self.database}', '{self.table_name}', 'embedding')"
+                    f"'{self.database}', '{self.table_name}', '{self._embedding_column}')"
                 )
             )
             rows = result.fetchall()
@@ -3330,7 +3433,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
         return {str(idx): dict(row._mapping) for idx, row in enumerate(rows)}
 
     def explain_index_health(self) -> Dict[str, Any]:
-        """Check vector index health and return diagnostics (v3 only).
+        """Check vector index health and return diagnostics (newer versions only).
 
         Combines information_schema.VECTOR_INDEXES metadata with
         EXPLAIN and EXPLAIN ANALYZE output to provide a comprehensive
@@ -3342,7 +3445,7 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                   metric, dimension, M, EF_CONSTRUCTION, etc.)
                 - explain: plain EXPLAIN output (index selection info)
                 - explain_analyze: EXPLAIN ANALYZE output with actual
-                  nodes_visited cost (v3 only)
+                  nodes_visited cost (newer versions only)
         """
         self._initialize()
         self._require_v3("explain_index_health()")
@@ -3381,8 +3484,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             sample_vec = json.dumps([0.0] * dim)
             result_set = session.execute(
                 sqlalchemy.text(
-                    f"EXPLAIN SELECT id FROM `{self.table_name}` "
-                    f"ORDER BY {dist_func}(embedding, "
+                    f"EXPLAIN SELECT `{self._id_column}` FROM `{self.table_name}` "
+                    f"ORDER BY {dist_func}(`{self._embedding_column}`, "
                     f"VEC_FROMTEXT('{sample_vec}')) LIMIT 10"
                 )
             )
@@ -3396,8 +3499,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 result_set = session.execute(
                     sqlalchemy.text(
                         f"EXPLAIN ANALYZE FORMAT=TREE "
-                        f"SELECT id FROM `{self.table_name}` "
-                        f"ORDER BY {dist_func}(embedding, "
+                        f"SELECT `{self._id_column}` FROM `{self.table_name}` "
+                        f"ORDER BY {dist_func}(`{self._embedding_column}`, "
                         f"VEC_FROMTEXT('{sample_vec}')) LIMIT 10"
                     )
                 )
@@ -3406,14 +3509,15 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 ]
             except Exception as e:
                 _logger.debug(
-                    "EXPLAIN ANALYZE failed (may not be supported): %s", e
+                    "EXPLAIN ANALYZE failed (may not be supported): %s",
+                    self._sanitize_error(e),
                 )
                 result["explain_analyze"] = None
 
         return result
 
     async def aexplain_index_health(self) -> Dict[str, Any]:
-        """Async check vector index health (v3 only)."""
+        """Async check vector index health (newer versions only)."""
         self._initialize()
         self._require_v3("explain_index_health()")
         if not self._capabilities.get("vector_indexes_view", False):
@@ -3449,8 +3553,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
             sample_vec = json.dumps([0.0] * dim)
             result_set = await session.execute(
                 sqlalchemy.text(
-                    f"EXPLAIN SELECT id FROM `{self.table_name}` "
-                    f"ORDER BY {dist_func}(embedding, "
+                    f"EXPLAIN SELECT `{self._id_column}` FROM `{self.table_name}` "
+                    f"ORDER BY {dist_func}(`{self._embedding_column}`, "
                     f"VEC_FROMTEXT('{sample_vec}')) LIMIT 10"
                 )
             )
@@ -3462,8 +3566,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 result_set = await session.execute(
                     sqlalchemy.text(
                         f"EXPLAIN ANALYZE FORMAT=TREE "
-                        f"SELECT id FROM `{self.table_name}` "
-                        f"ORDER BY {dist_func}(embedding, "
+                        f"SELECT `{self._id_column}` FROM `{self.table_name}` "
+                        f"ORDER BY {dist_func}(`{self._embedding_column}`, "
                         f"VEC_FROMTEXT('{sample_vec}')) LIMIT 10"
                     )
                 )
@@ -3472,7 +3576,8 @@ class PolarDBXVectorStore(BasePydanticVectorStore):
                 ]
             except Exception as e:
                 _logger.debug(
-                    "EXPLAIN ANALYZE failed (may not be supported): %s", e
+                    "EXPLAIN ANALYZE failed (may not be supported): %s",
+                    self._sanitize_error(e),
                 )
                 result["explain_analyze"] = None
 

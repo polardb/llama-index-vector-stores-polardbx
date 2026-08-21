@@ -34,9 +34,9 @@ def _build_query(text="database", k=3):
 
 
 def test_euclidean():
-    """EUCLIDEAN distance method works end-to-end."""
+    """EUCLIDEAN distance strategy works end-to-end."""
     vs = make_store(
-        table_name="test_li_euclidean", distance_method="EUCLIDEAN"
+        table_name="test_li_euclidean", distance_strategy="euclidean"
     )
     vs.add(make_nodes(TEXTS, METADATAS))
 
@@ -149,7 +149,7 @@ def test_inner_product():
     if v3:
         vs = make_store(
             table_name="test_li_innerprod",
-            distance_method="INNER_PRODUCT",
+            distance_strategy="inner_product",
         )
         vs.add(make_nodes(TEXTS, METADATAS))
 
@@ -163,7 +163,7 @@ def test_inner_product():
         try:
             vs = make_store(
                 table_name="test_li_innerprod",
-                distance_method="INNER_PRODUCT",
+                distance_strategy="inner_product",
             )
             assert False, "Expected NotSupportedError on old version"
         except NotSupportedError:
@@ -429,8 +429,8 @@ def test_invalid_embed_dim():
         pass
 
 
-def test_invalid_distance_method():
-    """Invalid distance_method raises ValueError."""
+def test_invalid_distance_strategy():
+    """Invalid distance_strategy raises ValueError."""
     from llama_index.vector_stores.polardbx import PolarDBXVectorStore
     from _helpers import DB_HOST, DB_NAME, DB_PASS, DB_PORT, DB_USER
 
@@ -443,7 +443,7 @@ def test_invalid_distance_method():
             database=DB_NAME,
             table_name="test_li_invaliddist",
             embed_dim=EMBED_DIM,
-            distance_method="INVALID",
+            distance_strategy="INVALID",
         )
         assert False, "Expected ValueError"
     except ValueError:

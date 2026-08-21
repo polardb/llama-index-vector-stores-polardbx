@@ -39,7 +39,7 @@ All transaction isolation levels (READ-COMMITTED, REPEATABLE-READ, SERIALIZABLE)
 
 - **Native Vector Storage**: Store embeddings using PolarDB-X's native `VECTOR(N)` data type
 - **HNSW Index**: Efficient approximate nearest neighbor search with configurable `M` and `EF_CONSTRUCTION` parameters
-- **Multiple Distance Metrics**: Support for Cosine, Euclidean, and Inner Product distance (v3)
+- **Multiple Distance Metrics**: Support for Cosine, Euclidean, and Inner Product distance (newer versions)
 - **Similarity Search**: Perform efficient similarity searches with configurable top-k
 - **MMR Search**: Maximal Marginal Relevance search for diverse results
 - **Metadata Filtering**: Filter search results by metadata with rich operators (`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin`)
@@ -47,7 +47,7 @@ All transaction isolation levels (READ-COMMITTED, REPEATABLE-READ, SERIALIZABLE)
 - **Dynamic Index Management**: Create, drop, and rebuild vector indexes at runtime without recreating tables
 - **Search Mode Control**: Switch between ANN (index-accelerated) and KNN (full-scan) modes per query
 - **Per-Query Tuning**: Adjust `ef_search` on a per-query basis for accuracy/latency trade-offs
-- **Index Health Monitoring**: Runtime statistics, index health diagnostics, and preload checks (v3)
+- **Index Health Monitoring**: Runtime statistics, index health diagnostics, and preload checks (newer versions)
 - **Batch Operations**: Batch insert with UPSERT support within a single transaction
 - **Full Async Support**: All public methods have async equivalents (`async_add`, `aquery`, etc.)
 - **Dual-Version Compatibility**: Automatically detects database capabilities and adapts SQL accordingly
@@ -97,7 +97,7 @@ vector_store = PolarDBXVectorStore(
     database="your-database",
     table_name="my_vectors",
     embed_dim=1536,
-    distance_method="COSINE",  # or "EUCLIDEAN", "INNER_PRODUCT" (v3 only)
+    distance_strategy="cosine",  # or "euclidean", "inner_product" (newer versions only)
 )
 
 # Create index from documents
@@ -126,7 +126,7 @@ vector_store = PolarDBXVectorStore.from_params(
     database="your-database",
     table_name="my_vectors",
     embed_dim=1536,
-    distance_method="COSINE",
+    distance_strategy="cosine",
     ssl=True,           # Enable TLS
     ssl_ca="/path/to/ca.pem",  # CA certificate
 )
@@ -138,9 +138,11 @@ vector_store = PolarDBXVectorStore.from_params(
 
 ```python
 from llama_index.vector_stores.polardbx import PolarDBXVectorStore
+from llama_index.core import Settings
 from llama_index.embeddings.dashscope import DashScopeEmbedding
 
-embed_model = DashScopeEmbedding(
+# Configure embedding model
+Settings.embed_model = DashScopeEmbedding(
     model_name="text-embedding-v4",
     api_key="your-dashscope-api-key",
 )
@@ -437,8 +439,8 @@ result = vector_store.query(query, ef_search=100)
 vector_store.apply_vector_index(
     index_name="my_vi",
     m=16,
-    distance="COSINE",
-    ef_construction=200,  # v3 only, ignored on old versions
+    distance="cosine",
+    ef_construction=200,  # newer versions only, ignored on older versions
 )
 
 # Drop the vector index
@@ -448,7 +450,7 @@ vector_store.drop_vector_index()
 vector_store.optimize()
 ```
 
-### Index Monitoring (v3 only)
+### Index Monitoring (Newer Versions Only)
 
 ```python
 # Get runtime statistics
@@ -559,7 +561,7 @@ async def main():
     await vector_store.adrop_vector_index()
     await vector_store.aoptimize()
 
-    # v3 monitoring
+    # newer version monitoring
     stats = await vector_store.aget_stats()
     await vector_store.apreload_index()
     check = await vector_store.apreload_check()
@@ -610,7 +612,7 @@ vector_store = PolarDBXVectorStore(
 )
 ```
 
-> **Note**: Partitioned vector tables are not supported on certain PolarDB-X v3 instances. The package automatically detects this and raises `NotSupportedError` if you attempt to use partitioning on an incompatible version.
+> **Note**: Partitioned vector tables are not supported on certain PolarDB-X instances. The package automatically detects this and raises `NotSupportedError` if you attempt to use partitioning on an incompatible version.
 >
 > **Note**: When partitioning is enabled, the `node_id` UNIQUE INDEX is automatically downgraded to a regular INDEX. PolarDB-X requires that unique indexes include the partition key, and since the `node_id` column (or custom `node_id_column`) is not the partition key, a UNIQUE constraint would be incompatible with partitioning. The `add()` method automatically adapts: non-partitioned tables use `ON DUPLICATE KEY UPDATE`, while partitioned tables use DELETE-then-INSERT to preserve upsert semantics.
 >
@@ -705,11 +707,11 @@ Supported partition strategies:
 | `database` | str | - | Database name |
 | `table_name` | str | `"llama_index_table"` | Table name for vector storage |
 | `embed_dim` | int | 1536 | Embedding dimension |
-| `distance_method` | str | `"COSINE"` | Distance function: `"COSINE"`, `"EUCLIDEAN"`, or `"INNER_PRODUCT"` (v3) |
+| `distance_strategy` | str | `"cosine"` | Distance function: `"cosine"`, `"euclidean"`, or `"inner_product"` (newer versions) |
 | `default_m` | int | 6 | HNSW index M parameter (DB allows 3-200; client validates positive int only) |
 | `perform_setup` | bool | True | Whether to auto-create table on init |
 | `debug` | bool | False | Enable SQLAlchemy echo mode |
-| `ef_construction` | int | None | HNSW build-time candidate list size (DB allows 5-1000, v3 only; client validates positive int only) |
+| `ef_construction` | int | None | HNSW build-time candidate list size (DB allows 5-1000, newer versions only; client validates positive int only) |
 | `ssl` | bool | False | Enable TLS/SSL encryption |
 | `ssl_ca` | str | None | Path to CA certificate for SSL verification (only effective when `ssl=True`) |
 | `vector_index_name` | str | None | Vector index name for FORCE INDEX hints (auto-detected if None) |
@@ -736,24 +738,24 @@ This integration uses PolarDB-X's native vector functions:
 - `VECTOR(N)` — Vector column data type with N dimensions
 - `VEC_FROMTEXT('[1,2,3]')` — Convert JSON array string to vector
 - `VEC_TOTEXT(vector)` — Convert vector to JSON array string
-- `VEC_DISTANCE(v1, v2)` — Auto-inferred distance function (v3)
+- `VEC_DISTANCE(v1, v2)` — Auto-inferred distance function (newer versions)
 - `VEC_DISTANCE_COSINE(v1, v2)` — Cosine distance (old versions)
 - `VEC_DISTANCE_EUCLIDEAN(v1, v2)` — Euclidean distance (old versions)
-- `VEC_DISTANCE_INNER_PRODUCT(v1, v2)` — Inner product distance (used when v3 auto-inference unavailable; INNER_PRODUCT distance itself requires v3)
-- `VECTOR_DIM(v)` — Get vector dimension (v3)
+- `VEC_DISTANCE_INNER_PRODUCT(v1, v2)` — Inner product distance (used when auto-inference is unavailable on older versions; INNER_PRODUCT distance itself requires newer versions)
+- `VECTOR_DIM(v)` — Get vector dimension (newer versions)
 - `VECTOR INDEX (col) M=N DISTANCE=COSINE` — HNSW vector index DDL
-- `EF_CONSTRUCTION=N` — HNSW build-time parameter in DDL (v3)
+- `EF_CONSTRUCTION=N` — HNSW build-time parameter in DDL (newer versions)
 - `SET SESSION vidx_hnsw_ef_search = N` — Per-session search width tuning
 - `SHOW GLOBAL STATUS LIKE 'Vidx%'` — Runtime index statistics
-- `CALL dbms_vidx.preload(db, table, col)` — Preload index into cache (v3)
-- `CALL dbms_vidx.preload_check(db, table, col)` — Check preload feasibility (v3)
-- `information_schema.VECTOR_INDEXES` — Vector index metadata view (v3)
+- `CALL dbms_vidx.preload(db, table, col)` — Preload index into cache (newer versions)
+- `CALL dbms_vidx.preload_check(db, table, col)` — Check preload feasibility (newer versions)
+- `information_schema.VECTOR_INDEXES` — Vector index metadata view (newer versions)
 
 ## Error Handling
 
-When using features that require PolarDB-X v3, a `NotSupportedError` is raised on older versions. Features that require v3 include:
+When using features that require newer PolarDB-X versions, a `NotSupportedError` is raised on older versions. Features that require newer versions include:
 
-- `distance_method="INNER_PRODUCT"` (init-time validation)
+- `distance_strategy="inner_product"` (init-time validation)
 - `preload_index()` / `apreload_index()`
 - `preload_check()` / `apreload_check()`
 - `explain_index_health()` / `aexplain_index_health()`

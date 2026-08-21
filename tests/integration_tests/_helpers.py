@@ -136,7 +136,7 @@ def make_nodes(
 
 def make_store(
     table_name: str = "test_polardbx_llamaindex",
-    distance_method: str = "COSINE",
+    distance_strategy: str = "cosine",
     pre_delete: bool = True,
     **kwargs,
 ) -> PolarDBXVectorStore:
@@ -156,7 +156,7 @@ def make_store(
         table_name=table_name,
         embed_dim=kwargs.pop("embed_dim", EMBED_DIM),
         default_m=kwargs.pop("default_m", 6),
-        distance_method=distance_method,
+        distance_strategy=distance_strategy,
         perform_setup=kwargs.pop("perform_setup", True),
         debug=kwargs.pop("debug", False),
         **kwargs,

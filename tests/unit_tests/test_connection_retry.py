@@ -93,7 +93,7 @@ class TestConnectionRetry:
         ), patch.object(
             PolarDBXVectorStore, "_detect_capabilities", fake_detect
         ), patch.object(
-            PolarDBXVectorStore, "_validate_distance_method", fake_validate
+            PolarDBXVectorStore, "_validate_distance_strategy", fake_validate
         ), patch.object(
             PolarDBXVectorStore, "_create_table_if_not_exists", fake_create
         ), patch.object(
@@ -136,7 +136,7 @@ class TestConnectionRetry:
         ), patch.object(
             PolarDBXVectorStore, "_detect_capabilities", fake_detect
         ), patch.object(
-            PolarDBXVectorStore, "_validate_distance_method", fake_validate
+            PolarDBXVectorStore, "_validate_distance_strategy", fake_validate
         ), patch.object(
             PolarDBXVectorStore, "_create_table_if_not_exists",
             lambda self: None,
@@ -180,7 +180,7 @@ class TestConnectionRetry:
         ), patch.object(
             PolarDBXVectorStore, "_detect_capabilities", fake_detect
         ), patch.object(
-            PolarDBXVectorStore, "_validate_distance_method", fake_validate
+            PolarDBXVectorStore, "_validate_distance_strategy", fake_validate
         ), patch.object(
             PolarDBXVectorStore, "_create_table_if_not_exists",
             lambda self: None,
@@ -224,7 +224,7 @@ class TestConnectionRetry:
         ), patch.object(
             PolarDBXVectorStore, "_detect_capabilities", fake_detect
         ), patch.object(
-            PolarDBXVectorStore, "_validate_distance_method", fake_validate
+            PolarDBXVectorStore, "_validate_distance_strategy", fake_validate
         ), patch.object(
             PolarDBXVectorStore, "_create_table_if_not_exists",
             lambda self: None,
@@ -270,7 +270,7 @@ class TestConnectionRetry:
         ), patch.object(
             PolarDBXVectorStore, "_detect_capabilities", fake_detect
         ), patch.object(
-            PolarDBXVectorStore, "_validate_distance_method", fake_validate
+            PolarDBXVectorStore, "_validate_distance_strategy", fake_validate
         ), patch.object(
             PolarDBXVectorStore, "_create_table_if_not_exists",
             lambda self: None,
@@ -314,7 +314,7 @@ class TestConnectionRetry:
         ), patch.object(
             PolarDBXVectorStore, "_detect_capabilities", fake_detect
         ), patch.object(
-            PolarDBXVectorStore, "_validate_distance_method", fake_validate
+            PolarDBXVectorStore, "_validate_distance_strategy", fake_validate
         ), patch.object(
             PolarDBXVectorStore, "_create_table_if_not_exists",
             lambda self: None,

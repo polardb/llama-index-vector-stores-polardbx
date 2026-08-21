@@ -40,11 +40,11 @@ class TestKwargsValidation:
             PolarDBXVectorStore._validate_kwargs({"table": "my_table"})
         assert "table_name" in str(exc_info.value)
 
-    def test_typo_distance_suggests_distance_method(self):
-        """Typo 'distance' should suggest 'distance_method'."""
+    def test_typo_distance_suggests_distance_strategy(self):
+        """Typo 'distance' should suggest 'distance_strategy'."""
         with pytest.raises(TypeError) as exc_info:
-            PolarDBXVectorStore._validate_kwargs({"distance": "COSINE"})
-        assert "distance_method" in str(exc_info.value)
+            PolarDBXVectorStore._validate_kwargs({"distance": "cosine"})
+        assert "distance_strategy" in str(exc_info.value)
 
     def test_unknown_kwarg_raises_typeerror(self):
         """Completely unknown kwarg should raise TypeError."""

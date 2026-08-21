@@ -129,11 +129,11 @@ def test_sync_apply_vector_index_variants():
 
     # M=32 with distance=EUCLIDEAN
     vs = make_store(
-        table_name="test_li_idx_m32", distance_method="EUCLIDEAN"
+        table_name="test_li_idx_m32", distance_strategy="euclidean"
     )
     vs.add(make_nodes(TEXTS, METADATAS))
     _drop_existing_vi(vs)
-    vs.apply_vector_index(index_name="vi_m32", m=32, distance="EUCLIDEAN")
+    vs.apply_vector_index(index_name="vi_m32", m=32, distance="euclidean")
     assert vs._detect_vector_index_name() == "vi_m32"
     vs.drop_vector_index(index_name="vi_m32")
     vs.drop()
@@ -269,14 +269,14 @@ def test_apply_vector_index_inner_product():
 
     if is_v3(vs):
         vs.apply_vector_index(
-            index_name="vi_ip", m=8, distance="INNER_PRODUCT"
+            index_name="vi_ip", m=8, distance="inner_product"
         )
         assert vs._detect_vector_index_name() == "vi_ip"
         vs.drop_vector_index(index_name="vi_ip")
     else:
         try:
             vs.apply_vector_index(
-                index_name="vi_ip", m=8, distance="INNER_PRODUCT"
+                index_name="vi_ip", m=8, distance="inner_product"
             )
             assert False, "Expected NotSupportedError on old version"
         except NotSupportedError:
